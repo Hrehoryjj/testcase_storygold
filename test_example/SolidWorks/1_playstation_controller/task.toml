@@ -10,17 +10,26 @@ keywords = ["solidworks", "cad", "design_iteration"]
 name = "StoryGold"
 
 [metadata]
-complete = true
 program = "SolidWorks"
 category = "design_iteration"
 units = "mm"
 human_baseline_minutes = 240
-max_score = 7.0
+max_score = 8.0
 
-notes = "PS3 controller (replaces the retired Xbox variant, whose surfacing broke during the engineer's edit). Mirror plane is x=80.5mm, not x=0. Grading is geometry-only and id/name-independent: roles (housing/dpad/face_buttons/ sticks/triggers/bumpers/centre) are assigned geometrically per capture. Widen is graded as mirror-pair separation growth (+15mm), robust to the housing remodel. The naive-flip guard is the port-light glyph cluster (a one-sided housing feature re-found by its mirror-invariant area multiset; it must stay on its original side). PS symbol glyphs are left-right symmetric, so symbol chirality is UNVERIFIABLE by design. Harness grades the active SolidWorks document, or a path passed as argv[1]. Baseline frozen via `harness.py --capture-baseline prompt/input.SLDPRT`.\n\nSCORING IS CONTINUOUS. Every component returns a subscore in [0,1], not PASS/FAIL, so adversarial near-misses separate from each other instead of collapsing to zero. The harness reads these weights at run time (load_scoring_weights), so editing a weight here changes the grade.\n\nNo component is a score-zeroing gate, and the weights follow the shape of the instruction rather than treating every criterion as equal. What the task ASKS FOR carries 5.0 of 7.0: 'widened by 15 mm' 1.5, 'clusters at mirrored positions' 1.5, 'left-handed layout achieved' 2.0 (heaviest -- it is the demand instruction.md's last sentence is about, and the one a candidate can satisfy geometrically while still getting wrong). What merely CONSTRAINS the edit carries 1.0: 'no new control interference' 0.5 and 'no unrequested changes' 0.5 -- both are passed by a candidate who did nothing at all, so they cannot be worth as much as the edits themselves. Model preservation, which the task description does name, carries the remaining 1.0: 'rebuild health' 0.5 and 'modelling hygiene' 0.5. The practical consequence is that an untouched seed scores 28.6%, not the 50% it collected when all five geometry components were equal. A tree that does not rebuild clean zeroes the five GEOMETRY components -- measurements from a broken rebuild are not trustworthy -- but health and hygiene are still scored, so 'one broken feature' and 'the tree is in ruins' no longer collapse onto the same total. All seven components are always emitted, so max_score stays constant and envelopes remain comparable across candidates.\n"
+notes = "PS3 controller (replaces the retired Xbox variant, whose surfacing broke during the engineer's edit). Mirror plane is x=80.5mm, not x=0. Grading is geometry-only and id/name-independent: roles (housing/dpad/face_buttons/ sticks/triggers/bumpers/centre) are assigned geometrically per capture. Widen is graded as mirror-pair separation growth (+15mm), robust to the housing remodel. The naive-flip guard is the port-light glyph cluster (a one-sided housing feature re-found by its mirror-invariant area multiset; it must stay on its original side). PS symbol glyphs are left-right symmetric, so symbol chirality is UNVERIFIABLE by design. Harness grades the active SolidWorks document, or a path passed as argv[1]. Baseline frozen via `harness.py --capture-baseline prompt/input.SLDPRT`.\n\nSCORING IS CONTINUOUS. Every component returns a subscore in [0,1], not PASS/FAIL, so adversarial near-misses separate from each other instead of collapsing to zero. The harness reads these weights at run time (load_scoring_weights), so editing a weight here changes the grade.\n\nNo component is a score-zeroing gate, and the weights follow the shape of the instruction rather than treating every criterion as equal. What the task ASKS FOR carries 5.0 of 8.0: 'widened by 15 mm' 1.5, 'clusters at mirrored positions' 1.5, 'left-handed layout achieved' 2.0 (heaviest -- it is the demand instruction.md's last sentence is about, and the one a candidate can satisfy geometrically while still getting wrong). What merely CONSTRAINS the edit carries 1.0: 'no new control interference' 0.5 and 'no unrequested changes' 0.5 -- both are passed by a candidate who did nothing at all, so they cannot be worth as much as the edits themselves. Model preservation, which the task description does name, carries the remaining 1.0: 'rebuild health' 0.5 and 'modelling hygiene' 0.5. The practical consequence is that an untouched seed scores 28.6%, not the 50% it collected when all five geometry components were equal. A tree that does not rebuild clean zeroes the five GEOMETRY components -- measurements from a broken rebuild are not trustworthy -- but health and hygiene are still scored, so 'one broken feature' and 'the tree is in ruins' no longer collapse onto the same total. 'markings preserved' carries 1.0 and reads the other half of instruction.md's last sentence: the symbols cut into the face buttons must REMAIN, where 'left-handed layout achieved' reads whether what remains is correctly oriented. It was added because adversarial_missing_glyphs -- the reference with those four symbols erased and nothing else changed -- scored full marks without it; the seed's buttons carry 50 engraving-scale faces, every model that keeps its symbols carries 50, and that model carries 0. The d-pad arrows are excluded and reported instead: the reference simplifies them (44 faces to 20) and every adversary inherits that, so they separate nothing. All eight components are always emitted, so max_score stays constant and envelopes remain comparable across candidates.\n"
 output_modality = "cad"
 accepted_output_formats = ["sldprt"]
 reference = ["solution/solution.SLDPRT"]
+
+[metadata.examples]
+"examples/adversarial_feature_tree_with_errors" = "feature tree riddled with rebuild errors and dangling references"
+"examples/adversarial_missing_glyphs" = "face-button glyphs missing after the mirror (logos do not read correctly)"
+"examples/adversarial_only_one_button_cluster_mirrored" = "only one button cluster moved across"
+"examples/adversarial_text_mirrored_incorrectly" = "text mirrored incorrectly"
+"examples/adversarial_unrequested_change_elsewhere" = "The correct left-handed layout plus one small unrequested cut on the housing."
+"examples/adversarial_unwidened_shell_with_correct_clusters" = "clusters swapped correctly on an unwidened shell"
+"examples/adversarial_widened_15mm_clusters_at_original_spacing" = "widened 15 mm but clusters left at original spacing"
+"examples/adversarial_widened_by_30mm" = "widened 30 mm instead of 15"
 
 [metadata.harness]
 entrypoint = "harness/harness.py"
@@ -73,132 +82,109 @@ role = "baseline_measurements"
 [[metadata.assets]]
 path = "environment/input.SLDPRT"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/environment/input.SLDPRT"
-sha256 = "cfb3c18638106b302f106a1429759445330757f6e055e0c47a31a7a7a3e51192"
-bytes = 11588163
-
-[[metadata.assets]]
-path = "environment/input.png"
-url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/environment/input.png"
-sha256 = "f8725fcfbc7967cda3728f85a07fa316c2f49da894356bc7c543e712e38dbcc1"
-bytes = 259686
-
-[[metadata.assets]]
-path = "environment/input.STL"
-url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/environment/input.STL"
-sha256 = "89f40c632b65ad350d316a221b3c28d7bc5aa8cb4891a8b150bdc5fc3e16c593"
-bytes = 2079734
+sha256 = "2fcf66949844baf442ce2d0609f2e2600412c26f6b046c195c49c251a54bd782"
+bytes = 11372221
 
 [[metadata.assets]]
 path = "solution/solution.SLDPRT"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/solution/solution.SLDPRT"
-sha256 = "48b56be8fd3a505aaae13d987316868eb1770b369eb19611f2a9e6ddbc6ef682"
-bytes = 25500615
-
-[[metadata.assets]]
-path = "solution/solution.png"
-url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/solution/solution.png"
-sha256 = "258e631c61db62976343e1c37dcc62fcc730b96d06b5d403c02e68d660700aea"
-bytes = 283421
-
-[[metadata.assets]]
-path = "solution/solution.STL"
-url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/solution/solution.STL"
-sha256 = "f69d0f234d9f0079391195ec12ecbed416b7c77302a537fcc54c52abde701629"
-bytes = 4010284
+sha256 = "1c3a58c8ded51b3faf8d84302b90a795b86994e598bcc03d513e4301c449324b"
+bytes = 24015410
 
 [[metadata.assets]]
 path = "examples/adversarial_feature_tree_with_errors"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/examples/adversarial_feature_tree_with_errors"
-sha256 = "e2acda5730da11ad43dc219ac82cb25d22fe6b491c159d624d04b58c1671f0be"
-bytes = 44056962
+sha256 = "e8546fd899f19650af8db992e21a46505baa016898ecd6a20afcc230b8e28c12"
+bytes = 50467738
 files = 3
 manifest = [
-  ["adversarial_feature_tree_with_errors.SLDPRT", "9ae45d3063efa048e8761cb3f3de56b2fa70af83964a87d39814f9977e353dfe", 40031068],
-  ["adversarial_feature_tree_with_errors.STL", "1b932ef6c669aa5492ca8d4fd5a98074e2414a7fc983d08c3fd52cf7cc0885fd", 3751184],
-  ["adversarial_feature_tree_with_errors.png", "4f12f83de2bd5890b268c61f1d0a5f821e354f8c9e3c39f0037090d4b6d5d211", 274710],
+  ["adversarial_feature_tree_with_errors.SLDPRT", "8b5774f4a181a3bbaf3df21a5aaab5c9c814e5a7fb40204b62929bda2571336f", 39781849],
+  ["adversarial_feature_tree_with_errors.STL", "208e69704d91af45e816c3335f246acf40c4e7dabff6ece4f10dd76e5fa9815a", 10155184],
+  ["adversarial_feature_tree_with_errors.png", "598aae2315cd4f60c1ee40979ffd9b7d5e7b877e5805b4b92ee1c53db8257206", 530705],
 ]
 
 [[metadata.assets]]
 path = "examples/adversarial_missing_glyphs"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/examples/adversarial_missing_glyphs"
-sha256 = "d782e985cba9b0a48afb3d8fd0f7236bc2a008276ab0e1f9bfe53ae3865c0cb1"
-bytes = 29355162
+sha256 = "0bced8b9423484806728db06977374059b881c3e21d03bd046250e74f1dc49a5"
+bytes = 36824248
 files = 3
 manifest = [
-  ["adversarial_missing_glyphs.SLDPRT", "c6e54e3a7832d99ac0edbab8aaae5133c6de682e8ec0df00f8e319d87d02721c", 25061457],
-  ["adversarial_missing_glyphs.STL", "f69d0f234d9f0079391195ec12ecbed416b7c77302a537fcc54c52abde701629", 4010284],
-  ["adversarial_missing_glyphs.png", "258e631c61db62976343e1c37dcc62fcc730b96d06b5d403c02e68d660700aea", 283421],
+  ["adversarial_missing_glyphs.SLDPRT", "71b517c6e7d42ebf54b72c1eec62f31c651aa56a20978fd9a202153ca2b96cfd", 25130347],
+  ["adversarial_missing_glyphs.STL", "2aa5f8dbb87bd637a6b7a520ae8e274002ceb5155eebca07261647b3d9361aba", 11133584],
+  ["adversarial_missing_glyphs.png", "3f1a4fa94db869ef438ff4b657b7f9ef46ac33f3a4303b2897b4374b36c72dfc", 560317],
 ]
 
 [[metadata.assets]]
 path = "examples/adversarial_only_one_button_cluster_mirrored"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/examples/adversarial_only_one_button_cluster_mirrored"
-sha256 = "e2ac462ef897f83c1993e4401a1a82d606bfa022162c87b69434c9856eff8b17"
-bytes = 27860108
+sha256 = "943939236e0b213128cb7e7696f3408493fa19b13f679a30def9584e49ed4c7f"
+bytes = 35849598
 files = 3
 manifest = [
-  ["adversarial_only_one_button_cluster_mirrored.SLDPRT", "54f6952da5ef87cdb7fddabfbed33ae5f83ad5f9d3af29e382d246dc025f3c3c", 23534759],
-  ["adversarial_only_one_button_cluster_mirrored.STL", "b1994e8ed92977d9908975c456b90e97a1f00459958aafc5733a2f11a35af773", 4043084],
-  ["adversarial_only_one_button_cluster_mirrored.png", "26ed7da7f0505449a3f6d140df8fc2308c3e768d329aedb9433b463c4777287a", 282265],
+  ["adversarial_only_one_button_cluster_mirrored.SLDPRT", "7565c3eb3e3c24e664109e8725966a72d88c7dd3f89cea6018f08ccce405e150", 23706622],
+  ["adversarial_only_one_button_cluster_mirrored.STL", "a47087be8d0de0dd334e35b15be913b6727d324234856475c18403395d7aa202", 11569784],
+  ["adversarial_only_one_button_cluster_mirrored.png", "50a937704febb3913fbcf7f41e7c601a5c16b0c39d2f9379e87ca2571d109d8c", 573192],
 ]
 
 [[metadata.assets]]
 path = "examples/adversarial_text_mirrored_incorrectly"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/examples/adversarial_text_mirrored_incorrectly"
-sha256 = "2ab0b496eca3d08dec72269dd5feef5b08b77cbdc7c7e23dcf347a728db70002"
-bytes = 28591239
+sha256 = "e2cf762fb5b21ad178799ef285bb0ef6e4b67b46ae32e18afdaffb8495d51a14"
+bytes = 36049366
 files = 3
 manifest = [
-  ["adversarial_text_mirrored_incorrectly.SLDPRT", "db327196258f3dc53092f1e27c4b83ea79890bfddd1ff29744623673b8aaac5a", 24296884],
-  ["adversarial_text_mirrored_incorrectly.STL", "300aded438c569048264d56d105dd438bcdebb6b09d48c41b7c2e4a74134a987", 4009784],
-  ["adversarial_text_mirrored_incorrectly.png", "bf1ee269b45eb2138beafebe900f1b529a6d0f3a3a26776fccd148ea31183195", 284571],
+  ["adversarial_text_mirrored_incorrectly.SLDPRT", "887bbe24925e017210f85b2e44bc88f1524beaa24e598ed3739716a3c1987e87", 24208762],
+  ["adversarial_text_mirrored_incorrectly.STL", "cea0770093e92b7f14115bc81c782d5e60d4810effdd435dff5e54920fce7697", 11277984],
+  ["adversarial_text_mirrored_incorrectly.png", "ad1ac06c063df38ad023e27347b8e3ad63cd6134fe24c7f7f6f72d1941724498", 562620],
 ]
 
 [[metadata.assets]]
 path = "examples/adversarial_unwidened_shell_with_correct_clusters"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/examples/adversarial_unwidened_shell_with_correct_clusters"
-sha256 = "7967940ab484b3a3d69f0d182c4e251b490e3c7addf67aa086cfd640ec1c015a"
-bytes = 24585324
+sha256 = "67a745c3d996e26884f4b8f3efe0083a2e2d937b06e66c6ce77d117573c915ce"
+bytes = 30143549
 files = 3
 manifest = [
-  ["adversarial_unwidened_shell_with_correct_clusters.SLDPRT", "9bcc77111785c051283fe69f8c5f94ed3379fc35627128efb24bd34c08e67484", 20764492],
-  ["adversarial_unwidened_shell_with_correct_clusters.STL", "effe8d4bc8cb6d1def74d1fd14f26cf4276dab62d0c5cb0e096da810bb65b004", 3545984],
-  ["adversarial_unwidened_shell_with_correct_clusters.png", "7e854b6fc83fdf5c922eb967f5d88949cabc907b4a8bb9751fcfed9c1d83ab3f", 274848],
+  ["adversarial_unwidened_shell_with_correct_clusters.SLDPRT", "7e8d7a6d2cdb43dcf73f0109afd70a285023bd0b5dff65a9470ffcede8c663c9", 20314565],
+  ["adversarial_unwidened_shell_with_correct_clusters.STL", "f51bad181892ac2b76024543a0e0e5d3e800510ca18c9127d204c37d646bb522", 9264184],
+  ["adversarial_unwidened_shell_with_correct_clusters.png", "51c1b141a8d544384323f2d1e08dd1c958549cbff79ab6aa1897f3ba23e4e99e", 564800],
 ]
 
 [[metadata.assets]]
 path = "examples/adversarial_widened_15mm_clusters_at_original_spacing"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/examples/adversarial_widened_15mm_clusters_at_original_spacing"
-sha256 = "c495dca4dddfb5608784b5d42f55bdcb43052325382803c82662aa269a811943"
-bytes = 14293170
+sha256 = "4cb3fa5523d8b4c9eb9e524185d5a48f1d5064f8b3c939d8ecdba054ee29e186"
+bytes = 19516783
 files = 3
 manifest = [
-  ["adversarial_widened_15mm_clusters_at_original_spacing.SLDPRT", "8c22247f0663db308031d4498dcbeb6742238785ef046102fe467de881a80151", 12022558],
-  ["adversarial_widened_15mm_clusters_at_original_spacing.STL", "ab8987d89f4796ee72fa997e98fa1b34735ef174579ec3e5443d12b27777e154", 2014534],
-  ["adversarial_widened_15mm_clusters_at_original_spacing.png", "876a8f32d6413b63fb52e02f9dc1a93d35255b074773df3e515a6581a0d94feb", 256078],
+  ["adversarial_widened_15mm_clusters_at_original_spacing.SLDPRT", "3c62f78796d8d829dee432be43aa5c8c8aa689fa20320163b63c524c3a9b01f5", 11946730],
+  ["adversarial_widened_15mm_clusters_at_original_spacing.STL", "ac3da3ffb2cf28dc3a960ad9b1e6bb214401cfaeece87e3b49c08d10ff3bbb61", 6975534],
+  ["adversarial_widened_15mm_clusters_at_original_spacing.png", "d4856ebc5f4d9fcd4ad76de9de973db48685ed62fd8acf6a94b1c31eccb78c0c", 594519],
 ]
 
 [[metadata.assets]]
 path = "examples/adversarial_widened_by_30mm"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/examples/adversarial_widened_by_30mm"
-sha256 = "278fb71c5507610e3805c3cb9380dfd09196df9c830d717a07418ad341b4d236"
-bytes = 38456791
+sha256 = "66cf9680226112aca6e9d9d13ca92f6b3f0ff1c0d5b87a69ca093e55d4860863"
+bytes = 46214728
 files = 3
 manifest = [
-  ["adversarial_widened_by_30mm.SLDPRT", "27533cf1aebb6cbec19db5b98877b295b42014a537845c5ab1f07106d83a1c15", 34215470],
-  ["adversarial_widened_by_30mm.STL", "f4850bdca6cb0658b516556587a2eb7340f677c7594e44c2d77a64caf4219886", 3960284],
-  ["adversarial_widened_by_30mm.png", "92600057f42880a10324ea1242a96e4d6066464bb9fd2a3118399bfa50956161", 281037],
+  ["adversarial_widened_by_30mm.SLDPRT", "4a9a1be8c4c479933519592b9408a90bf148e073c68b80e50b4301e4a9c88f7c", 34617673],
+  ["adversarial_widened_by_30mm.STL", "798b0a42ab2d14927e236efbad0d398e970374af75c24e7645c4bdeb8dc4a775", 11101284],
+  ["adversarial_widened_by_30mm.png", "30db16c326a1cabf68b90c7a5675547bab4886e7ba375af032715acaeff2817d", 495771],
 ]
 
 [[metadata.assets]]
 path = "examples/adversarial_unrequested_change_elsewhere"
 url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/examples/adversarial_unrequested_change_elsewhere"
-sha256 = "4fe977c40aadb3544b6e765a1ca203afefa3be90192c689386ce651c711c2bac"
-bytes = 25439543
-files = 2
+sha256 = "04234dd06fab774abbf51cf964a55d61e1adfa3a75d9c920e2d8514d699145fb"
+bytes = 35896073
+files = 3
 manifest = [
-  ["adversarial_unrequested_change_elsewhere.SLDPRT", "0c407b0e4f4c071f99dc96a1ca78d177a319952968850e9a62f4291bc1e51fcc", 25055163],
-  ["adversarial_unrequested_change_elsewhere.png", "30d45d981c9e75eee1d32a694b2a5cf37ab15337733be14faaadef9658b471c9", 384380],
+  ["adversarial_unrequested_change_elsewhere.SLDPRT", "0ef02fc42688af58c5ffcd7a29bf2e321b27bc29b0c4c68f433d62e9c2a7c362", 23825461],
+  ["adversarial_unrequested_change_elsewhere.STL", "342f2bf01da8323fc0b70856212e5f9aa6db6efa5f20f41fe9e992cd98487afb", 11499684],
+  ["adversarial_unrequested_change_elsewhere.png", "994790f7d75876c8d00bc103121805ec59a49a99386215d6ed68e77f992f984d", 570928],
 ]
 
 [verifier]
@@ -208,7 +194,7 @@ manifest = [
 # environment exists whether verification runs "shared" with the agent's
 # live SolidWorks session or some other arrangement Harbor doesn't
 # currently model for GUI apps.
-timeout_sec = 1200.0
+timeout_sec = 300.0
 
 [verifier.env]
 
@@ -232,3 +218,31 @@ build_timeout_sec = 1200.0
 # binary.
 
 [solution.env]
+
+[[metadata.assets]]
+path = "tests/task/reference"
+url = "https://openaievalsetub0ktk.blob.core.windows.net/assets/SolidWorks/1_playstation_controller/tests/task/reference"
+sha256 = "5eff5ef9833724e96a85aa39c280350dc2113da2964434841f5d04d6a88c9567"
+bytes = 34289573
+files = 19
+manifest = [
+  ["adversarial_feature_tree_with_errors.STL", "1b932ef6c669aa5492ca8d4fd5a98074e2414a7fc983d08c3fd52cf7cc0885fd", 3751184],
+  ["adversarial_feature_tree_with_errors.png", "4f12f83de2bd5890b268c61f1d0a5f821e354f8c9e3c39f0037090d4b6d5d211", 274710],
+  ["adversarial_missing_glyphs.STL", "f69d0f234d9f0079391195ec12ecbed416b7c77302a537fcc54c52abde701629", 4010284],
+  ["adversarial_missing_glyphs.png", "258e631c61db62976343e1c37dcc62fcc730b96d06b5d403c02e68d660700aea", 283421],
+  ["adversarial_only_one_button_cluster_mirrored.STL", "b1994e8ed92977d9908975c456b90e97a1f00459958aafc5733a2f11a35af773", 4043084],
+  ["adversarial_only_one_button_cluster_mirrored.png", "26ed7da7f0505449a3f6d140df8fc2308c3e768d329aedb9433b463c4777287a", 282265],
+  ["adversarial_text_mirrored_incorrectly.STL", "300aded438c569048264d56d105dd438bcdebb6b09d48c41b7c2e4a74134a987", 4009784],
+  ["adversarial_text_mirrored_incorrectly.png", "bf1ee269b45eb2138beafebe900f1b529a6d0f3a3a26776fccd148ea31183195", 284571],
+  ["adversarial_unrequested_change_elsewhere.png", "30d45d981c9e75eee1d32a694b2a5cf37ab15337733be14faaadef9658b471c9", 384380],
+  ["adversarial_unwidened_shell_with_correct_clusters.STL", "effe8d4bc8cb6d1def74d1fd14f26cf4276dab62d0c5cb0e096da810bb65b004", 3545984],
+  ["adversarial_unwidened_shell_with_correct_clusters.png", "7e854b6fc83fdf5c922eb967f5d88949cabc907b4a8bb9751fcfed9c1d83ab3f", 274848],
+  ["adversarial_widened_15mm_clusters_at_original_spacing.STL", "ab8987d89f4796ee72fa997e98fa1b34735ef174579ec3e5443d12b27777e154", 2014534],
+  ["adversarial_widened_15mm_clusters_at_original_spacing.png", "876a8f32d6413b63fb52e02f9dc1a93d35255b074773df3e515a6581a0d94feb", 256078],
+  ["adversarial_widened_by_30mm.STL", "f4850bdca6cb0658b516556587a2eb7340f677c7594e44c2d77a64caf4219886", 3960284],
+  ["adversarial_widened_by_30mm.png", "92600057f42880a10324ea1242a96e4d6066464bb9fd2a3118399bfa50956161", 281037],
+  ["input.STL", "89f40c632b65ad350d316a221b3c28d7bc5aa8cb4891a8b150bdc5fc3e16c593", 2079734],
+  ["input.png", "f8725fcfbc7967cda3728f85a07fa316c2f49da894356bc7c543e712e38dbcc1", 259686],
+  ["solution.STL", "f69d0f234d9f0079391195ec12ecbed416b7c77302a537fcc54c52abde701629", 4010284],
+  ["solution.png", "258e631c61db62976343e1c37dcc62fcc730b96d06b5d403c02e68d660700aea", 283421],
+]

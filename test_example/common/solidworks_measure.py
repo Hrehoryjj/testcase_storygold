@@ -259,55 +259,6 @@ def appearance_coverage(model_doc, bodies=None):
             "base_ambiguous": len(base) > 1}
 
 
-def _select_label_face(body, max_area: float = LABEL_FACE_MAX_AREA):
-    best, best_loops, best_area = None, -1, -1.0
-    faces = z(body.GetFaces)
-    if not faces:
-        return None
-    for face in faces:
-        try:
-            area = float(z(face.GetArea))
-        except Exception:
-            continue
-        if area >= max_area:
-            continue
-        try:
-            loops = int(z(face.GetLoopCount))
-        except Exception:
-            loops = 0
-        if loops > best_loops or (loops == best_loops and area > best_area):
-            best, best_loops, best_area = face, loops, area
-    return best
-
-
-def measure_logo_faces(body, appearance_map, appearance_name: str = "color") -> dict:
-    faces_out, total_area = [], 0.0
-    faces = z(body.GetFaces) or []
-    for face in faces:
-        try:
-            area = float(z(face.GetArea))
-            box = z(face.GetBox)
-            key = _appearance_key(area, float(box[0]), float(box[2]))
-        except Exception:
-            continue
-        found = appearance_map.get(key)
-        if not found or found.get("name") != appearance_name:
-            continue
-        m = face_metrics(face)
-        total_area += m["area_m2"]
-        faces_out.append({
-            "loops": m["loops"],
-            "area_m2": m["area_m2"],
-            "outline_centroid_m": m["centroid_m"],
-            "skew_x": m["skew_x"],
-            "skew_z": m["skew_z"],
-            "color_rgb": found.get("rgb"),
-        })
-    return {"face_count": len(faces_out),
-            "total_area_m2": total_area,
-            "faces": faces_out}
-
-
 def _wrap_com(obj):
     if obj is None:
         return None

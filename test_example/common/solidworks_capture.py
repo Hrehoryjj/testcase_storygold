@@ -434,8 +434,16 @@ def measure_assembly(build, empty, path=None, baseline=None, progress=None,
     from common import solidworks_session as sws
     from common import solidworks_assembly as SA
     if sws.win32com is None:
-        raise SystemExit("measuring needs pywin32 on Windows; score a stored "
-                         "capture with --score-from instead")
+        #: WHY, not just THAT. "Not installed" and "installed but its DLL
+        #: will not load" are different faults; this line used to print
+        #: the same sentence for both and send the reader to a `pip
+        #: install` that changes nothing.
+        raise SystemExit(
+            f"measuring needs pywin32 on Windows, and this process cannot "
+            f"use it -- {sws.why_no_win32()}. Python is "
+            f"{sys.executable}. Score a stored capture with --score-from "
+            f"instead, or run the harness from the interpreter that has "
+            f"pywin32.")
     safe = SA.safe
     say = progress or (lambda *_: None)
     app = sws.attach()

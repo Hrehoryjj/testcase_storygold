@@ -20,6 +20,232 @@ def _numeric(value):
     return f if math.isfinite(f) else None
 
 
+def render_dir(task_dir):
+    """Where the pictures a judge is shown are kept, for one task.
+
+    Beside `results/`, and not shipped: a record of runs, like the captures
+    and the judge cache. Kept rather than thrown away so a verdict can be
+    checked afterwards against the thing that was actually looked at --
+    the answer is in the capture, and this is the question.
+
+    Twenty-one harnesses each defined this, all to the same path. The task
+    directory is passed rather than found because a harness already knows
+    its own: it is the one thing the caller has and this module does not.
+    """
+    return Path(task_dir) / "results" / "renders"
+
+
+def grading_timeout_s(task_toml, default=900.0):
+    """How long one model may be graded for, from `[verifier].timeout_sec`.
+
+    ONE number, in one place. It used to live in three -- task.toml, the
+    Harness class and the batch Spec -- and raising it in task.toml alone
+    changed nothing, because the batch runner took its own: the reference
+    kept being killed at 900 s while the file said 1800.
+
+    `[verifier].timeout_sec` IS THAT PLACE, and it is Harbor's own key.
+    There used to be a second one, `[metadata.harness].timeout_s`, written
+    beside it and required to hold the same number: Harbor stopped the
+    verifier on one, this repository budgeted grading on the other, and
+    two of its own tools disagreed about which to read -- run_release took
+    `timeout_s`, report.py took `timeout_sec`. Nothing derived one from
+    the other, so they were an invariant maintained by hand across 95
+    files. They never drifted; that is luck, not a guarantee, and the
+    cheapest way to keep an invariant is to not have two things.
+
+    Read out of the parsed section, never by scanning lines. Twenty-three
+    harnesses once scanned for a line starting `timeout_s`, which also
+    matches `timeout_sec` in a different section, and one task with no
+    `timeout_s` at all was reading Harbor's by accident and agreeing with
+    itself by luck. The accident was the line scan, not the key; reading
+    the key deliberately out of the parsed table is the fix, not a relapse.
+    """
+    try:
+        import tomllib
+    except ImportError:                                     # py < 3.11
+        try:
+            import tomli as tomllib                         # type: ignore
+        except ImportError:
+            return default
+    try:
+        data = tomllib.loads(Path(task_toml).read_text(encoding="utf-8"))
+    except Exception:                                       # noqa: BLE001
+        return default
+    got = _numeric((data.get("verifier") or {}).get("timeout_sec"))
+    return got if got else default
+
+
+def write_env(var, text):
+    """Hand the batch runner what it asked for, if it asked.
+
+    WITHOUT THIS THE LIVE RUN KEEPS NOTHING. `--batch` shells out per
+    model and reads back only the envelope, so a run that scored zero
+    everywhere left no capture to look at and no report to read: the
+    `results/full/` files beside it were the previous OFFLINE run's, and
+    they said the drawings had been read perfectly. Two runs, two
+    stories, one directory.
+
+    The variable is named in the message rather than the path, because
+    the variable is the thing the caller set and can fix.
+    """
+    dest = os.environ.get(var)
+    if not dest:
+        return
+    try:
+        out = Path(dest)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+    except Exception as exc:                                # noqa: BLE001
+        print(f"  ! could not write {var}: {exc}", file=sys.stderr)
+
+
+def declared_examples(task_toml):
+    """The example folders `task.toml` actually declares.
+
+    THE CORPUS IS WHAT SHIPS, NOT WHAT IS ON DISK. A folder that is
+    present but not listed is parked, and a batch that walked the
+    directory instead would grade it and report a second model passing,
+    which reads from `summary.md` exactly like a corpus with two
+    references. Task 67 shipped that mistake once.
+
+    Returns None when the file cannot be read or declares nothing, and
+    then every folder is taken -- a task with no `[metadata.examples]`
+    block is not a task with no examples. Two of the eight callers
+    declare a block; the rest rely on that None.
+
+    Read out of the parsed section. Eight harnesses scanned for lines
+    beginning `"examples/` and skipped the ones beginning `#`, which is
+    a comment stripper written by hand to do what the parser does for
+    free -- and both of the tasks that use this park their folder BY
+    commenting the entry out, so the hand-rolled version was the only
+    thing standing between a parked model and a second reference.
+    """
+    try:
+        import tomllib
+    except ImportError:                                     # py < 3.11
+        try:
+            import tomli as tomllib                         # type: ignore
+        except ImportError:
+            return None
+    try:
+        data = tomllib.loads(Path(task_toml).read_text(encoding="utf-8"))
+    except Exception:                                       # noqa: BLE001
+        return None
+    block = (data.get("metadata") or {}).get("examples") or {}
+    want = {str(k).split("/")[1] for k in block
+            if str(k).startswith("examples/") and "/" in str(k)}
+    return want or None
+
+
+def true_box(body):
+    """A body's real extent, from its tessellation, never from its box.
+
+    `GetBodyBox` returns the box of the UNTRIMMED surfaces. On 67's
+    sheath it reads 1644 x 5272 x 17.76 mm for a solid that is
+    189 x 59 x 6; the tessellation is the trimmed geometry and reads
+    188.834 x 59.052 x 6.000. Each caller's docstring carries its own
+    measurement, because the error is a property of the part and not of
+    this arithmetic.
+
+    The stored box is used only where no face was tessellated at all --
+    a wrong answer being better than no answer nowhere, but a missing
+    tessellation means there is nothing else to say.
+    """
+    lo = [float("inf")] * 3
+    hi = [float("-inf")] * 3
+    seen = False
+    for f in (body.get("faces_all") or []):
+        t = f.get("tess")
+        if not t or not t.get("extent_mm"):
+            continue
+        e = t["extent_mm"]
+        seen = True
+        for i in range(3):
+            lo[i] = min(lo[i], e[i])
+            hi[i] = max(hi[i], e[i + 3])
+    if seen:
+        return [round(v, 4) for v in lo + hi]
+    return list(body.get("bbox_mm") or [0] * 6)
+
+
+def judge_cache_dir(task_dir):
+    """Where an answer is kept so the same question is not paid for twice.
+
+    One question is one answer: the key is the prompt, so a capture whose
+    numbers did not change is not re-asked, and `--rejudge` over fourteen
+    captures costs only the ones that actually differ.
+
+    Beside `results/`, and not shipped, for the same reason as the
+    renders: a record of runs, not of the task.
+
+    `HARNESS_JUDGE_CACHE` overrides it, so a batch can point every task at
+    one cache -- two harnesses already honoured it and the other
+    twenty-three ignored it, which is the kind of split that makes a flag
+    look broken rather than absent. Twenty-five copies named the directory
+    two different ways, `results/judge` seventeen times and
+    `results/judge_cache` six; the majority spelling wins and no cache was
+    orphaned, because none had been written yet.
+    """
+    return Path(os.environ.get("HARNESS_JUDGE_CACHE")
+                or (Path(task_dir) / "results" / "judge"))
+
+
+def _rot3(rot, v):
+    """A row-major 3x3 as SolidWorks hands it back, applied to a point."""
+    return [rot[0] * v[0] + rot[3] * v[1] + rot[6] * v[2],
+            rot[1] * v[0] + rot[4] * v[1] + rot[7] * v[2],
+            rot[2] * v[0] + rot[5] * v[1] + rot[8] * v[2]]
+
+
+def aabb(box, rot, tr):
+    """Box of a part-space box after the component transform.
+
+    All eight corners go through, so the answer can only be larger than
+    the true box -- the safe direction for a filter that must not throw
+    away a real overlap.
+
+    Thirteen harnesses carried this. Twelve had dropped the paragraph
+    above, which is the only thing that says why the over-estimate is
+    deliberate: without it the next reader tightens the bound and the
+    filter starts discarding real overlaps, silently and in the safe
+    direction's opposite.
+    """
+    out = [[], [], []]
+    for i in (0, 3):
+        for j in (1, 4):
+            for k in (2, 5):
+                q = _rot3(rot, [box[i], box[j], box[k]])
+                p = [q[0] + tr[0], q[1] + tr[1], q[2] + tr[2]]
+                for n in range(3):
+                    out[n].append(p[n])
+    return [min(out[0]), min(out[1]), min(out[2]),
+            max(out[0]), max(out[1]), max(out[2])]
+
+
+def decimal_text(value):
+    """A number out of text, whichever decimal separator it carries.
+
+    ANNOTATION AND DOCUMENT TEXT IS WRITTEN IN A LOCALE. A drawing saved
+    on the Polish SolidWorks the grading box runs writes `0,009` and
+    `Ra  0,8`; the same drawing saved elsewhere writes `0.009`. Datasheets
+    and reports arrive both ways for the same reason. A candidate is
+    graded on the number, never on the separator their install chose, so
+    every harness that reads a number out of text goes through here.
+
+    Three harnesses each carried their own `replace(",", ".")` before this
+    existed -- 2_shaft_surfaces on finish symbols and geometric tolerance
+    frames, 59_metal_grade on DimXpert annotation names, and
+    95_thermoplastic_bracket on five separate datasheet patterns -- which
+    is three places to remember and three to get wrong.
+
+    Returns None rather than raising, like `_numeric`, so a caller can
+    tell "no number here" from a number that happens to be zero.
+    """
+    if value is None:
+        return None
+    return _numeric(str(value).strip().replace(",", "."))
+
+
 def clamp01(value):
     f = _numeric(value)
     return 0.0 if f is None else max(0.0, min(1.0, f))
@@ -106,20 +332,6 @@ def is_run_request(argv=None):
     return len(argv) >= 2 and argv[1] == RUN_FLAG
 
 
-def safe_check(key, descriptions, check_fn, *args):
-    try:
-        return check_fn(*args)
-    except Exception:
-        return (key, False, descriptions.get(key, key))
-
-
-def all_failed(descriptions, **overrides):
-    return {
-        key: (key, overrides.get(key, False), desc)
-        for key, desc in descriptions.items()
-    }
-
-
 RESULT_VAR_NAMES = ("solid", "result", "model", "robot", "part", "final",
                     "assembly", "body", "output", "res")
 
@@ -129,14 +341,6 @@ MIN_SOLID_VOLUME = 1e-9
 def _cq():
     import cadquery as cq
     return cq
-
-
-def is_shape(obj):
-    try:
-        cq = _cq()
-    except ImportError:
-        return False
-    return isinstance(obj, (cq.Workplane, cq.Shape, cq.Assembly))
 
 
 def to_shapes(value):
@@ -197,16 +401,6 @@ def safe_volume(shape):
         return float(shape.Volume())
     except Exception:
         return 0.0
-
-
-def shape_signature(shape):
-    bb = shape.BoundingBox()
-    c = shape.Center()
-    return {
-        "volume": safe_volume(shape),
-        "centroid": (c.x, c.y, c.z),
-        "bbox": (bb.xmin, bb.ymin, bb.zmin, bb.xmax, bb.ymax, bb.zmax),
-    }
 
 
 def to_mesh(shape, tolerance=0.05, angular_tolerance=0.2, method="stl"):
@@ -411,15 +605,6 @@ def spawn_run(harness_file, script_path, out_geom, out_meta, timeout,
     return meta
 
 
-def spawn_run_ok(harness_file, script_path, out_geom, out_meta, timeout,
-                 overrides=None):
-    result = spawn_run(harness_file, script_path, out_geom, out_meta, timeout,
-                       overrides=overrides)
-    if result.get("ok"):
-        return True, None
-    return False, result.get("error", "execution failed")
-
-
 def runner_main(script_path, out_geom, out_meta, overrides_json=None,
                 fmt="stl"):
     cq = _cq()
@@ -593,25 +778,6 @@ def transitively_references(tree, root_name, target_name, _memo=None):
     return any(transitively_references(tree, r, target_name, _memo) for r in referenced)
 
 
-def contains_attr(node, attr):
-    return any(
-        isinstance(n, ast.Attribute) and n.attr == attr
-        for n in ast.walk(node)
-    )
-
-
-def normalized_assignment(tree, name):
-    xs = assignments(tree, name)
-    if not xs:
-        return None
-
-    return ast.dump(
-        value_node(xs[-1]),
-        annotate_fields=True,
-        include_attributes=False
-    )
-
-
 def is_numeric_expr(node, known_params=()):
     if isinstance(node, ast.Constant):
         return isinstance(node.value, (int, float)) and not isinstance(node.value, bool)
@@ -623,35 +789,6 @@ def is_numeric_expr(node, known_params=()):
     if isinstance(node, ast.Name):
         return node.id in known_params
     return False
-
-
-def referenced_after(tree, name, after_lineno):
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Name) and node.id == name
-                and isinstance(node.ctx, ast.Load)
-                and getattr(node, "lineno", 0) > after_lineno):
-            return True
-    return False
-
-
-def scan_imports_and_attrs(tree):
-    imports, attrs = set(), set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imports.update(a.name.split(".")[0] for a in node.names)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imports.add(node.module.split(".")[0])
-        elif isinstance(node, ast.Attribute):
-            attrs.add(node.attr)
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            attrs.add(node.func.id)
-    return imports, attrs
-
-
-def load_module(path):
-    import runpy
-
-    return runpy.run_path(str(path))
 
 
 HARNESS_VERSION = "1.0.0"
@@ -739,6 +876,24 @@ def finalize(task_dir, checks, version=HARNESS_VERSION, must_pass=(),
     # stay clamped to [0, 1]; each ungated check contributes subscore * weight
     # and adds its weight to max_score. Weight 0 contributes nothing.
     weights = weights or {}
+    # EVERY EMITTED CHECK MUST BE PRICED. `weights.get(name, 1)` below
+    # silently defaults an unlisted criterion to 1, so a criterion added to
+    # a harness but not to its ALL_CRITERIA would be scored at full weight
+    # while the rubric never mentions it -- and the report would print a
+    # table that is not the one grading. One assert here covers every
+    # harness in the set, at the single point they all pass through, which
+    # is why this does not live in each harness.
+    #
+    # Only when the harness declares weights at all: the unimplemented
+    # stubs carry ALL_CRITERIA = {} and emit no checks, and that pair is
+    # consistent.
+    if weights and subscores:
+        unpriced = sorted(set(subscores) - set(weights))
+        if unpriced:
+            raise ValueError(
+                f"{read_task_id(task_dir)}: these checks are not in "
+                f"ALL_CRITERIA and would be scored at a default weight of "
+                f"1: {unpriced}")
     score = round(sum(v * weights.get(name, 1)
                       for name, v in ungated.items()), 4)
     failed_must_pass = [name for name in must_pass

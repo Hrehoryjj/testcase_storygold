@@ -11,89 +11,6 @@ can be fragile on heavily filleted imports).
 from __future__ import annotations
 
 
-def _cq():
-    import cadquery as cq
-    return cq
-
-
-def load_brep(path):
-    return _cq().Shape.importBrep(str(path))
-
-
-def solids_by_z(shape):
-    """Solid lumps of `shape`, sorted bottom-up by bbox zmin."""
-    return sorted(shape.Solids(), key=lambda s: s.BoundingBox().zmin)
-
-
-def split_top_lump(shape):
-    """Split into (top_lump, rest_compound).
-
-    Returns (None, None) unless the topmost lump sits fully above the rest.
-    """
-    cq = _cq()
-    solids = solids_by_z(shape)
-    if len(solids) < 2:
-        return None, None
-    top, rest = solids[-1], solids[:-1]
-    if top.BoundingBox().zmin <= max(s.BoundingBox().zmax for s in rest):
-        return None, None
-    return top, rest[0] if len(rest) == 1 else cq.Compound.makeCompound(rest)
-
-
-def box_region(center, dims):
-    """Axis-aligned box Shape for use as a probe or clip region."""
-    cq = _cq()
-    return cq.Workplane("XY", origin=tuple(center)).box(*dims).val()
-
-
-def rect_ring_region(outer_wl, inner_wl, z0, z1):
-    """Rectangular-frame prism (outer box minus inner box) spanning [z0, z1]."""
-    zc, h = (z0 + z1) / 2.0, z1 - z0
-    outer = box_region((0, 0, zc), (outer_wl[0], outer_wl[1], h))
-    inner = box_region((0, 0, zc), (inner_wl[0], inner_wl[1], h + 1.0))
-    return outer.cut(inner)
-
-
-_AXES = {"x": 0, "y": 1, "z": 2}
-
-
-def probe_segments(shape, point, axis, t0, t1, side=0.6,
-                   min_vol=1e-6, merge_gap=0.05):
-    """Material intervals of `shape` along an axis-aligned probe line.
-
-    Intersects a thin square prism (cross-section side x side) running along
-    `axis` from t0 to t1 through `point`, and returns the merged, sorted
-    [(start, end), ...] extents of material along the axis.
-    """
-    i = _AXES[axis]
-    center = list(point)
-    center[i] = (t0 + t1) / 2.0
-    dims = [side, side, side]
-    dims[i] = t1 - t0
-    inter = shape.intersect(box_region(center, dims))
-    segs = []
-    for s in inter.Solids():
-        if s.Volume() <= min_vol:
-            continue
-        bb = s.BoundingBox()
-        segs.append(((bb.xmin, bb.ymin, bb.zmin)[i],
-                     (bb.xmax, bb.ymax, bb.zmax)[i]))
-    segs.sort()
-    merged = []
-    for lo, hi in segs:
-        if merged and lo <= merged[-1][1] + merge_gap:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
-        else:
-            merged.append((lo, hi))
-    return merged
-
-
-def probe_voids(segments):
-    """Gaps between consecutive material segments from probe_segments."""
-    return [(a_hi, b_lo)
-            for (_, a_hi), (b_lo, _) in zip(segments, segments[1:])]
-
-
 def cylindrical_faces(shape, rmax=None, zband=None, vertical_only=True):
     """Cylindrical faces of `shape` as dicts with axis location and radius.
 
@@ -121,34 +38,23 @@ def cylindrical_faces(shape, rmax=None, zband=None, vertical_only=True):
     return out
 
 
-def axis_positions(faces, ndigits=2):
-    """Deduplicated, sorted (x, y) axis locations from cylindrical_faces."""
-    return sorted({(round(f["x"], ndigits), round(f["y"], ndigits))
-                   for f in faces})
-
-
-def _mesh_sym_diff_volume(a, b, clip):
-    import trimesh
-
-    meshes = [to_trimesh(s, tolerance=0.02) for s in (a, b, clip)]
-    ma = trimesh.boolean.intersection([meshes[0], meshes[2]])
-    mb = trimesh.boolean.intersection([meshes[1], meshes[2]])
-    only_a = trimesh.boolean.difference([ma, mb])
-    only_b = trimesh.boolean.difference([mb, ma])
-    return abs(only_a.volume) + abs(only_b.volume)
-
-
 def region_diff_volume(a, b, clip):
     """Symmetric-difference volume of shapes `a` and `b` inside `clip`.
 
-    ~0 means the two shapes are geometrically identical within the region.
-    Falls back to manifold3d mesh booleans if the OCC boolean fails.
+    ~0 means the two shapes are geometrically identical within the region,
+    and that threshold is the whole point of the function.
+
+    NO MESH FALLBACK. This used to answer a failed OCC boolean with the
+    same question asked of tessellations instead, and return the number
+    without saying which had produced it. The two do not answer alike: a
+    mesh symmetric difference of two identical solids is the tessellation
+    error, not ~0, so the fallback could not meet the contract above and
+    the caller could not tell that it had been given a different kind of
+    number. An exact boolean that fails is a fact about the geometry and
+    it travels.
     """
-    try:
-        ca, cb = a.intersect(clip), b.intersect(clip)
-        return ca.cut(cb).Volume() + cb.cut(ca).Volume()
-    except Exception:
-        return _mesh_sym_diff_volume(a, b, clip)
+    ca, cb = a.intersect(clip), b.intersect(clip)
+    return ca.cut(cb).Volume() + cb.cut(ca).Volume()
 
 
 def plane_basis(normal):
@@ -183,12 +89,15 @@ def slice_polygons(mesh, normal, offset):
     T = np.eye(4)
     T[:3, :3] = np.vstack([e1, e2, n])
     T[:3, 3] = -T[:3, :3] @ (n * float(offset))
-    try:
-        to_2d = getattr(section, "to_2D", None) or section.to_planar
-        planar, _ = to_2d(to_2D=T, check=False)
-        polys = planar.polygons_full
-    except Exception:
-        return []
+    #: A SECTION THAT WILL NOT RESOLVE IS NOT AN EMPTY SECTION. This used
+    #: to return [] here, which every caller reads as "no material at this
+    #: plane" -- the same answer `section is None` gives for a plane that
+    #: genuinely misses the mesh. One is a fact about the part and the
+    #: other is a fact about the slicer, and a wall measured as absent
+    #: because the slicer failed is a wall reported as missing.
+    to_2d = getattr(section, "to_2D", None) or section.to_planar
+    planar, _ = to_2d(to_2D=T, check=False)
+    polys = planar.polygons_full
 
     out = []
     for poly in polys:
@@ -214,7 +123,8 @@ def multiplane_areas(mesh, normal, offsets):
     {p . normal == offset}, batched through trimesh's section_multiplane.
 
     Returns a float array aligned with `offsets`; 0.0 where a plane misses
-    the mesh or its section cannot be resolved.
+    the mesh. A section that cannot be resolved raises rather than reading
+    as an empty one -- see `slice_polygons`.
     """
     import numpy as np
     n = np.asarray(normal, float)
@@ -405,42 +315,6 @@ def to_trimesh(shape, tolerance=0.005):
     )
 
 
-def zpose(theta_deg, dz=0.0):
-    """4x4 rigid transform: rotate about +Z by theta_deg (about the origin),
-    then translate by dz along Z. The pose parameterization of mate/insertion
-    sims whose motion is twist-plus-plunge."""
-    import numpy as np
-    import trimesh
-    t = trimesh.transformations.rotation_matrix(
-        np.radians(theta_deg), [0.0, 0.0, 1.0])
-    t[2, 3] += dz
-    return t
-
-
-class PoseCollider:
-    """Pose-parameterized interference tester against a fixed set of obstacle
-    meshes, backed by python-fcl through trimesh.collision. Obstacles are
-    meshed once at construction; each query applies only a rigid transform to
-    the moving mesh, so thousands of pose probes (alignment scans, descent and
-    twist binary searches) stay cheap. `penetration` returns the deepest
-    contact in mm (0.0 when separated), which callers threshold instead of
-    computing boolean intersection volumes per pose. Mesh the parts with a
-    tessellation tolerance well below the penetration threshold in use."""
-
-    def __init__(self, obstacles):
-        import trimesh
-        self._manager = trimesh.collision.CollisionManager()
-        for name, mesh in obstacles.items():
-            self._manager.add_object(name, mesh)
-
-    def penetration(self, mesh, transform):
-        hit, contacts = self._manager.in_collision_single(
-            mesh, transform=transform, return_data=True)
-        if not hit:
-            return 0.0
-        return float(max((c.depth for c in contacts), default=0.0))
-
-
 # ---------------------------------------------------------------------------
 # Sampled point-cloud comparison between two meshes in a SHARED frame.
 # No alignment is performed: callers that care about pose compare raw
@@ -455,31 +329,35 @@ def surface_points(mesh, n, seed=0):
     return np.asarray(pts, dtype=float)
 
 
+def _pcu():
+    """point_cloud_utils, or None where it cannot be installed.
+
+    env_requirements.txt pins point-cloud-utils==0.34.0, which ships no
+    wheel for Python 3.14 -- only a C++ sdist. On such a host every metric
+    below raised ModuleNotFoundError, and harnesses that wrap geometry in
+    `except Exception` scored even the REFERENCE 0 on all of it
+    (5_robot_scan: 1/9 for its own solution). The scipy fallback computes
+    the same Euclidean nearest-neighbour distances.
+    """
+    try:
+        import point_cloud_utils as pcu
+        return pcu
+    except ImportError:
+        return None
+
+
 def _nn_dists(a, b):
     """Nearest-neighbor distance from each point of `a` to cloud `b`."""
     import numpy as np
-    import point_cloud_utils as pcu
-    d, _ = pcu.k_nearest_neighbors(np.ascontiguousarray(a),
-                                   np.ascontiguousarray(b), 1)
+    a = np.ascontiguousarray(a, dtype=float)
+    b = np.ascontiguousarray(b, dtype=float)
+    pcu = _pcu()
+    if pcu is not None:
+        d, _ = pcu.k_nearest_neighbors(a, b, 1)
+        return np.asarray(d, dtype=float).ravel()
+    from scipy.spatial import cKDTree
+    d, _ = cKDTree(b).query(a, k=1)
     return np.asarray(d, dtype=float).ravel()
-
-
-def chamfer_mean(a_pts, b_pts):
-    """Symmetric chamfer distance as the MEAN of the two one-sided means
-    (pcu.chamfer_distance returns their sum; halved here so the value
-    reads as 'average nearest-neighbor distance')."""
-    import numpy as np
-    import point_cloud_utils as pcu
-    return 0.5 * float(pcu.chamfer_distance(np.ascontiguousarray(a_pts),
-                                            np.ascontiguousarray(b_pts)))
-
-
-def hausdorff_pct(a_pts, b_pts, q=95.0):
-    """Symmetric q-th percentile Hausdorff distance (robust to a few
-    outlier points, unlike the max that pcu.hausdorff_distance returns)."""
-    import numpy as np
-    return max(float(np.percentile(_nn_dists(a_pts, b_pts), q)),
-               float(np.percentile(_nn_dists(b_pts, a_pts), q)))
 
 
 def f_score(a_pts, b_pts, tau):
@@ -490,34 +368,3 @@ def f_score(a_pts, b_pts, tau):
     if precision + recall == 0:
         return 0.0
     return 2 * precision * recall / (precision + recall)
-
-
-def points_in_mesh(mesh, points):
-    """Boolean containment mask via libigl's fast winding number
-    (pcu.triangle_soup_fast_winding_number). Robust where parity ray
-    tests are not: tessellation cracks (winding stays ~1 inside) and
-    overlapping bodies (winding ~2 inside, still >= 0.5). A point is
-    inside when the generalized winding number is >= 0.5."""
-    import numpy as np
-    import point_cloud_utils as pcu
-    w = pcu.triangle_soup_fast_winding_number(
-        np.ascontiguousarray(mesh.vertices, dtype=float),
-        np.ascontiguousarray(mesh.faces, dtype=np.int32),
-        np.ascontiguousarray(points, dtype=float))
-    return np.asarray(w, dtype=float) >= 0.5
-
-
-def montecarlo_iou(mesh_a, mesh_b, n=200_000, seed=0):
-    """Volumetric IoU estimated by winding-number containment tests on
-    seeded uniform samples in the union bounding box."""
-    import numpy as np
-    lo = np.minimum(mesh_a.bounds[0], mesh_b.bounds[0])
-    hi = np.maximum(mesh_a.bounds[1], mesh_b.bounds[1])
-    rng = np.random.default_rng(seed)
-    pts = rng.uniform(lo, hi, size=(int(n), 3))
-    in_a = points_in_mesh(mesh_a, pts)
-    in_b = points_in_mesh(mesh_b, pts)
-    union = int(np.count_nonzero(in_a | in_b))
-    if union == 0:
-        return 0.0, None
-    return int(np.count_nonzero(in_a & in_b)) / union, None

@@ -230,6 +230,38 @@ def _add(models, path):
     models[label] = Path(path)
 
 
+def _merge_models(models, found):
+    """Fold a directory's discovered models in, keeping what is already there.
+
+    `models.update(found)` was the whole of this, and a plain dict update
+    on a label that already exists REPLACES it. That is not a tidy detail:
+    the reference is normally the first path on the command line, so
+    anything in a later directory that happens to share its stem takes its
+    place -- silently, under its name, in a table that still reads
+    `solution`.
+
+    It happened. `--batch solution/solution.SLDPRT examples` on
+    1_playstation_controller graded sixteen models where seventeen were
+    named, and the row called `solution` was measured from a stray
+    `examples/solution.SLDPRT` that is byte-identical to the model with
+    its button glyphs removed. The reference was not graded at all and
+    nothing said so; the 7.000 in the summary belonged to an adversary.
+
+    A collision now keeps the EARLIER path -- a model named explicitly
+    outranks one swept up from a folder -- renames the newcomer through
+    `_add`, and says so on stderr. Nothing is dropped and nothing is
+    replaced, so a duplicate becomes a visible extra row rather than an
+    invisible substitution.
+    """
+    for label, path in found.items():
+        if label in models and Path(models[label]) != Path(path):
+            print(f"[warn] two models want the label {label!r}: keeping "
+                  f"{models[label]}, renaming {path}", file=sys.stderr)
+            _add(models, path)
+        else:
+            models[label] = Path(path)
+
+
 def _order(spec, models):
     front = [k for k in spec.order if k in models]
     return {k: models[k] for k in front + sorted(set(models) - set(front))}
@@ -247,7 +279,7 @@ def collect_models(spec, paths):
         if p.is_dir():
             found = spec.discover(p)
             if found:
-                models.update(found)
+                _merge_models(models, found)
             else:
                 for q in sorted(p.rglob(spec.model_glob)):
                     _add(models, q)
@@ -343,7 +375,7 @@ def read_envelope(stdout):
 
 
 def _run_child(cmd, out_dir, label, timeout, report_path=None,
-               capture_path=None):
+               capture_path=None, log_name=None):
     """One model in its own process.
 
     Its own process because a COM session that fell over on one model is not
@@ -358,7 +390,15 @@ def _run_child(cmd, out_dir, label, timeout, report_path=None,
         Path(capture_path).parent.mkdir(parents=True, exist_ok=True)
         env["HARNESS_CAPTURE_JSON"] = str(capture_path)
     out_dir.mkdir(parents=True, exist_ok=True)
-    log = out_dir / f"{label}.log"
+    #: `log_name` KEEPS TWO KINDS OF RUN APART. Measuring and re-scoring
+    #: write to the same out_dir under the same labels, and while both
+    #: used `<label>.log` the second silently destroyed the first: a
+    #: `--score-from` sweep run after a live batch -- which is the
+    #: ordinary way to look at the table again -- overwrote every
+    #: measurement log with three seconds of arithmetic. The progress
+    #: lines that say where an hour of CAD went are not reproducible; the
+    #: re-score is.
+    log = out_dir / f"{log_name or label}.log"
     t0 = time.time()
     # stderr goes STRAIGHT to the log rather than into a pipe we read at the
     # end: a run that has to be killed is exactly the one whose progress
@@ -435,7 +475,8 @@ def batch_grade(spec, models, out_dir, cap_dir, timeout, score=False,
         res = _run_child(cmd, out_dir, label, timeout,
                          report_path=out_dir / "full" / f"{label}.report.json",
                          capture_path=(None if score else
-                                       cap_dir / f"{label}.json"))
+                                       cap_dir / f"{label}.json"),
+                         log_name=f"{label}.score" if score else label)
         stale = [out_dir / f"{label}.envelope.json",
                  out_dir / "full" / f"{label}.report.json"]
         if not res["ok"]:
@@ -721,8 +762,17 @@ def check_capture_schema(spec, path):
         return
     try:
         got = json.loads(Path(path).read_text(encoding="utf-8")).get("schema")
-    except Exception:                                           # noqa: BLE001
-        return
+    except Exception as exc:                                    # noqa: BLE001
+        #: A CHECK THAT OPTS OUT WHEN IT CANNOT CHECK IS NOT A CHECK.
+        #: This used to return here, so a capture that would not parse
+        #: went on to be scored -- and the incident in the docstring
+        #: above is what that costs: a number, no table, and nothing
+        #: in the output saying the field the criterion reads was
+        #: never in the file.
+        raise SystemExit(
+            f"{Path(path).name} cannot be read as a capture "
+            f"({type(exc).__name__}: {exc}). A capture this harness cannot "
+            f"parse is not a capture it can score.")
     if capture_family(got) and capture_family(got) != want:
         raise SystemExit(
             f"{Path(path).name} is a capture of another task: it says "
@@ -796,10 +846,12 @@ The questions a measurement cannot settle -- every task answers, including
 the ones that use no judgement at all:
   harness.py --judge                  what this task judges, or why it does not
   options on any mode above:
-    --no-judge                        do not ask. The judged criterion falls
-                                      back to what the geometry alone can
-                                      say, so the task grades as it did
-                                      before that criterion existed
+    --no-judge                        do not ask. Nothing then answers the
+                                      judged criterion, and scoring a
+                                      capture taken this way STOPS on that
+                                      row rather than inventing a value --
+                                      a missing judgement and a judgement
+                                      of zero are different facts
     --no-images                       ask, but without showing a render
 
 Both act where the QUESTION is put, which is at capture time. Scoring stays
@@ -881,6 +933,13 @@ def do_judge(spec):
     state, creds = JR.available(), JR.credentials()
     print(f"\nimportable       : {state['ok']}"
           f"{'' if state['ok'] else '  -- ' + str(state['why'])}")
+    #: WHICH MODEL, ON THE LINE ABOVE THE CREDENTIAL. A run that does not
+    #: say this cannot be compared with anyone else's: the judge moved
+    #: from Claude to GPT between two checkouts of this repository and
+    #: every judged number moved with it, while both runs printed the
+    #: same "credential route : azure".
+    print(f"judge model      : {creds.get('judge', '?')}"
+          f"    (JUDGE_ROUTE=gpt|claude, JUDGE_MODEL on claude)")
     print(f"credential route : {creds['route']}  "
           f"(azure={creds['azure']})")
     print(f"asking           : {JR.asking_enabled()}"
@@ -906,12 +965,23 @@ def cli(spec, argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     # Taken out BEFORE any mode parses, because it applies to all of them
     # and each mode has its own parser that would reject an unknown flag.
+    #
+    # AND SET THE ENVIRONMENT, not only the module global. `--batch` runs
+    # each model in a FRESH CHILD PROCESS, and a global set here never
+    # reaches it: the parent printed "measuring only; --no-judge is set",
+    # shrank the budget accordingly, and every child went on asking. Found
+    # on task 75, where the machine's proxy made each question fail after
+    # fifteen attempts -- 315 seconds per model, on a run that had been
+    # told not to ask at all. `asking_enabled()` and `looking_enabled()`
+    # read these variables already; the child inherits them.
     if "--no-images" in argv:
         argv = [a for a in argv if a != "--no-images"]
+        os.environ["HARNESS_NO_IMAGES"] = "1"
         from common import judge_runner as _JR
         _JR.set_looking(False)
     if "--no-judge" in argv:
         argv = [a for a in argv if a != "--no-judge"]
+        os.environ["HARNESS_NO_JUDGE"] = "1"
         from common import judge_runner as _JR
         _JR.set_asking(False)
     if argv and argv[0] == "--judge":

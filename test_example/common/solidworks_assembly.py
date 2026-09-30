@@ -259,11 +259,145 @@ def assembly_mass(doc):
 
 
 
-def rebuild_state(doc):
-    """Force a rebuild and say whether it worked. Read-only is fine: the
-    rebuild happens in memory and CloseDoc throws it away."""
+def rebuild_state(doc, force=True):
+    """Force a rebuild, say whether it worked -- and what it COST.
+
+    The old docstring said "read-only is fine: the rebuild happens in
+    memory and CloseDoc throws it away". That is true about the FILE and
+    false about the MEASUREMENT. Every reading taken after this call sees
+    the rebuilt tree, and on an assembly whose parts are modelled in
+    context the forced rebuild cannot update their external references, so
+    it MANUFACTURES errors: on task 60's corpus every model, the reference
+    included, went from 0 feature errors to 10 dangling mates and LOST
+    eight features -- and the one model that really did carry broken mates
+    was buried under them.
+
+    "Errors after I broke it" and "errors as delivered" are two different
+    facts, and returning only `ok` let them arrive as one. So the tree is
+    now counted BEFORE and AFTER, and the difference is reported:
+
+        before / after   feature and error counts either side of the call
+        manufactured     errors this call created and features it lost
+        trustworthy      False when it created any -- the health reading
+                         taken after this call is about the rebuild, not
+                         about the model
+
+    `force=False` takes the reading without rebuilding anything, which is
+    what a criterion about the model as delivered wants.
+
+    A caller that only reads `ok` keeps working; nothing is removed.
+    """
+    def summary(c):
+        """Only the few numbers this reading needs. The whole census here
+        would double the size of every capture for data nothing reads.
+
+        WARNINGS ARE IN THE LIST because the damage this function exists to
+        report arrives as warnings, not as errors: a dangling external
+        reference flags a feature YELLOW, and `feature_census` counts
+        yellow separately from red. A before/after pair that omits the
+        warning count cannot see the very thing the docstring above
+        describes -- ten dangling mates read as nothing changed.
+        """
+        c = c or {}
+        return {k: c.get(k) for k in
+                ("features", "error_count", "warning_count",
+                 "suppressed", "mates")}
+
+    before = summary(safe(lambda: feature_census(doc)))
+    if not force:
+        return {"ok": None, "error": "not forced (force=False)",
+                "forced": False, "trustworthy": True,
+                "before": before, "after": before, "manufactured": {}}
     ok, err = probed(lambda: bool(z(doc.ForceRebuild3(False))), "ForceRebuild3")
-    return {"ok": ok, "error": err}
+    after = summary(safe(lambda: feature_census(doc)))
+
+    def n(d, k):
+        v = d.get(k)
+        return v if isinstance(v, (int, float)) else None
+
+    made, lost, warned = None, None, None
+    eb, ea = n(before, "error_count"), n(after, "error_count")
+    fb, fa = n(before, "features"), n(after, "features")
+    wb, wa = n(before, "warning_count"), n(after, "warning_count")
+    if eb is not None and ea is not None:
+        made = max(0, ea - eb)
+    if fb is not None and fa is not None:
+        lost = max(0, fb - fa)
+    #: A dangling reference the rebuild created is yellow, not red, so
+    #: counting only `error_count` reports the harmless case and misses
+    #: the one this function was written for.
+    if wb is not None and wa is not None:
+        warned = max(0, wa - wb)
+    manufactured = {}
+    if made:
+        manufactured["errors_created"] = made
+    if warned:
+        manufactured["warnings_created"] = warned
+    if lost:
+        manufactured["features_lost"] = lost
+    # Unknown is not the same as none: if either census failed we cannot
+    # claim the rebuild was harmless.
+    known = None not in (eb, ea, fb, fa)
+    return {"ok": ok, "error": err, "forced": True,
+            "trustworthy": bool(known and not manufactured),
+            "counts_read": known,
+            "before": before, "after": after,
+            "manufactured": manufactured}
+
+
+def tree_faults(census, notice_code=1):
+    """What a feature census says is WRONG, as against merely noted.
+
+    Two numbers and the tally behind them:
+
+        serious    errors above `notice_code`. Adding a component or a
+                   hole series raises `Reference:1` and `HoleSeries:1` on
+                   almost every candidate that did the work, the
+                   reference included; a mate that will not solve comes
+                   back at 48. Counting those equally grades a model
+                   for doing what it was asked to do. Task 13 found
+                   this and filtered it locally; this is that filter,
+                   in the one place.
+
+        dangling   warnings whose TYPE is `Reference`. A dangling
+                   external reference flags its feature YELLOW, so
+                   `error_count` cannot see it at all -- and it sits AT
+                   notice level, so a filter by code cannot let it
+                   through either. It is picked out by type instead,
+                   which is what the criterion it serves actually names:
+                   "no rebuild errors or dangling references".
+
+    Every other warning is left alone. `MateGroup:1` and `HoleSeries:1`
+    turn up on models that did nothing wrong, and a row that charged for
+    them would charge the reference.
+    """
+    census = census or {}
+    errs = census.get("errors") or []
+    warns = census.get("warnings") or []
+    tally = {}
+    for e in list(errs) + list(warns):
+        k = f"{e.get('type')}:{e.get('code')}"
+        tally[k] = tally.get(k, 0) + 1
+    serious = sum(1 for e in errs if (e.get("code") or 0) > notice_code)
+    dangling = sum(1 for w in warns
+                   if str(w.get("type") or "").startswith("Reference"))
+    return {"serious": serious, "dangling": dangling, "tally": tally,
+            "errors": len(errs), "warnings": len(warns)}
+
+
+def rebuild_damage(rec):
+    """What a stored `rebuild` block says the forced rebuild cost.
+
+    Returns None when the capture predates this reading -- which a scorer
+    must treat as "not known", never as "nothing happened".
+    """
+    if not isinstance(rec, dict) or "manufactured" not in rec:
+        return None
+    return {"errors_created": rec["manufactured"].get("errors_created", 0),
+            "warnings_created": rec["manufactured"].get(
+                "warnings_created", 0),
+            "features_lost": rec["manufactured"].get("features_lost", 0),
+            "trustworthy": rec.get("trustworthy")}
 
 
 
@@ -553,6 +687,98 @@ def body_record(body, index):
     return rec
 
 
+
+
+#: swBodyType_e. Solid is the geometry; sheet and wire are construction
+#: leftovers when they survive into a delivered model.
+SW_BODY_TYPES = ((0, "solid"), (1, "sheet"), (2, "wire"))
+
+#: The census key for a document with no components. See body_census.
+PART_KEY = "<document>"
+
+
+def body_census(doc):
+    """{component name: {"solid": n, "sheet": n, "wire": n}}.
+
+    A PART answers for itself under its own title, so the same reading
+    works for a single-part task and for an assembly.
+
+    Counts EVERY body, not just the visible ones: a surface body hidden in
+    the tree is still shipped, and hiding it is not cleaning it up.
+    """
+    out = {}
+
+    def count(md, key):
+        if md is None:
+            return
+        row = {}
+        for t, label in SW_BODY_TYPES:
+            r, _ = probed(lambda t=t: md.GetBodies2(t, False),
+                          f"GetBodies2({t})")
+            try:
+                row[label] = len([b for b in (r or []) if b is not None])
+            except TypeError:
+                row[label] = 0
+        out[key] = row
+
+    comps = safe(lambda: list(z(doc.GetComponents(False)) or []), [])
+    if comps:
+        for c in comps:
+            name = safe(lambda c=c: str(z(c.Name2)).split("/")[-1], "?")
+            count(safe(lambda c=c: sws.redispatch(z(c.GetModelDoc2))), name)
+    else:
+        # A PART IS KEYED BY A SENTINEL, NOT ITS TITLE. The title is the
+        # file name, and a candidate's file is `solution` where the seed's
+        # is `input` -- keying on that would match nothing between them,
+        # and body_delta would report no change at all. That is a silent
+        # false pass, which is worse than no check. Component names inside
+        # an assembly are stable across the pair, so they keep theirs.
+        count(doc, PART_KEY)
+    return out
+
+
+def body_delta(census, seed_census):
+    """What the candidate ADDED and REMOVED, per body type, vs the seed.
+
+    A DELTA, never an absolute. Task 27's seed ships six sheet bodies
+    across five of its fifteen components, so "no surface bodies" would
+    fail the seed and the reference alike; what marks a candidate is
+    CHANGING the inventory.
+
+    BOTH DIRECTIONS, because both are real. Measured on task 27: one
+    candidate added a sheet body to the bottle part and shipped it, and
+    the same candidate also dropped a solid, 16 to 15 -- a removal that
+    the component-level "all baseline components remain present and
+    unsuppressed" criterion cannot see, because the component is still
+    there and still live, just emptier.
+
+    Matched by component name: a candidate that edits a part in place
+    keeps its name. A renamed or new component is a different question
+    and is deliberately not answered here.
+
+    Returns (added, removed, detail); detail names every component whose
+    inventory moved, in either direction.
+    """
+    seed = seed_census or {}
+    added = {label: 0 for _, label in SW_BODY_TYPES}
+    removed = {label: 0 for _, label in SW_BODY_TYPES}
+    detail = []
+    for name, row in sorted((census or {}).items()):
+        base = seed.get(name)
+        if base is None:
+            continue
+        moved = {}
+        for _, label in SW_BODY_TYPES:
+            d = int(row.get(label, 0)) - int(base.get(label, 0))
+            if d > 0:
+                added[label] += d
+            elif d < 0:
+                removed[label] += -d
+            if d:
+                moved[label] = d
+        if moved:
+            detail.append({"component": name, "delta": moved})
+    return added, removed, detail
 
 def bodies_of(comp):
     """EVERY solid body of a component, in PART coordinates.

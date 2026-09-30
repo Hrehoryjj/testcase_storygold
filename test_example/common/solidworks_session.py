@@ -36,6 +36,24 @@ except ImportError as exc:   # non-Windows: importable, unusable
     win32com = None
     VARIANT = None
 
+def why_no_win32():
+    """Why pywin32 is unusable in THIS process, in one line.
+
+    "Not installed" and "installed and its DLL will not load" are
+    different faults with different fixes, and a caller that printed only
+    "measuring needs pywin32" made them look identical. A run that stops
+    for the second reason sent whoever read it to `pip install pywin32`,
+    which changes nothing.
+    """
+    if win32com is not None:
+        return None
+    import sys
+    return (f"{type(_IMPORT_ERROR).__name__}: {_IMPORT_ERROR}"
+            if _IMPORT_ERROR is not None else
+            f"pywin32 did not import and said nothing; python is "
+            f"{sys.executable}")
+
+
 # swDocumentTypes_e
 DOC_PART = 1
 DOC_ASSEMBLY = 2
@@ -457,27 +475,6 @@ def open_document(app, path, doc_type=None,
     if doc is None:
         raise RuntimeError(f"could not open {path}")
     return dyn(doc), True
-
-
-def open_part_readonly_invisible(app, path):
-    """Open a part silently, read-only, and invisible (so it never steals
-    the user's active window); visibility preference is restored."""
-    existing = find_document(app, path)
-    if existing is not None:
-        return existing
-    try:
-        app.DocumentVisible(False, DOC_PART)
-    except Exception:
-        pass
-    try:
-        errs, warns = byref_i4(), byref_i4()
-        return app.OpenDoc6(path, DOC_PART, OPEN_SILENT | OPEN_READONLY,
-                            "", errs, warns)
-    finally:
-        try:
-            app.DocumentVisible(True, DOC_PART)
-        except Exception:
-            pass
 
 
 def activate(app, doc):

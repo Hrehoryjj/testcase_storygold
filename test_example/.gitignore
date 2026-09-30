@@ -1,6 +1,7 @@
 .DS_Store
 cad-eval-set-1.0/
 cad-eval-set-2.0/
+gdm-cad-eval-set/
 __pycache__/
 *.pyc
 venv/
@@ -13,8 +14,17 @@ venv/
 *.stl
 *.ply
 *.png
+# Photographs and renders imported with a task: supplier datasheets, colour
+# references, dimensioned section shots. Same rule as *.png, added later
+# because only four were ever committed and they slipped through.
+*.jpg
+*.jpeg
 *.prt
 *.SLDDRW
+# Blender documents. Added with the first real Blender task (100_yeti_mic);
+# until then every Blender/* folder was an empty stub, so nothing matched.
+*.blend
+*.blend1
 # SolidWorks Simulation results: multi-GB, pinned like any other CAD binary
 *.cwr
 *.CWR
@@ -22,3 +32,25 @@ venv/
 # Per-task scratch runs from tools/try_model.py (model answer,
 # candidate file, harness report). Regenerated on demand.
 _runs/
+
+# Pinned to blob storage by tools/sync.py, so not in git as well.
+# Added with the extensions 101_ohlins_suspension and the crane needed.
+*.mp4
+*.obj
+*.mtl
+*.ipt
+*.iam
+*.stp
+# PhotoView scene and texture files: blob assets pinned by tools/sync.py, like the CAD files
+*.hdr
+*.p2m
+*.p2s
+*.dds
+# Harness grading scratch -- renders and LLM-judge cache (common/harness_base render_dir / judge_cache_dir)
+results/
+
+# FreeCAD writes these beside a document when it saves one over itself
+*.FCBak
+*.fcbak
+# tools/sw_lock.py: the lock directory held while a job drives SolidWorks
+.sw_lock/

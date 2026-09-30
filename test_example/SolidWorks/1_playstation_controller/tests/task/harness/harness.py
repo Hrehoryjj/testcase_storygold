@@ -143,19 +143,28 @@ from common import solidworks_session as SW                     # noqa: E402
 from common import harness_cli as HC                            # noqa: E402
 from common import harness_base as HB                           # noqa: E402
 from common.harness_base import (Harness, finalize,             # noqa: E402
-                                 score_error)
+                                 score_error, write_env)
 
 BASELINE_PATH = TASK_DIR / "prompt" / "input.json"
 
 PASS, PARTIAL, FAIL, UNVERIFIABLE = "PASS", "PARTIAL", "FAIL", "UNVERIFIABLE"
 
-HARNESS_VERSION = "2.1.5"
+HARNESS_VERSION = "2.3.1"
 # Bumped whenever capture() changes what it records or what a field means.
 # /3 changed plane_x_m from "the baseline's plane" to "the plane this part
 # actually has". A /2 capture still scores correctly -- its plane equals the
 # baseline's, so the normalisation is a no-op -- but it cannot exercise the
 # translation handling, hence the warning rather than a refusal.
 CAPTURE_SCHEMA = "ps3-capture/4"
+
+#: HOW FAR THE MEASURED MIRROR MAY SIT from where the seed's mirror
+#: travelled to, before it is called a mis-detection rather than an
+#: edit. The widening this task asks for moves CONTROLS apart; it
+#: does not move the plane they are mirrored about. The slips seen
+#: in practice are tens of millimetres (80.5 -> 137.9, -> 122.9),
+#: so 25 mm separates them from anything an author would do on
+#: purpose without a re-freeze.
+PLANE_SLIP_MAX_MM = 25.0
 
 # The frozen seed measurement every candidate is compared against.
 # /2 added the modelling census and the per-role bounding boxes: without them
@@ -175,6 +184,7 @@ POLICY = {
 
 C_HEALTH = "rebuild health"
 C_HYGIENE = "modelling hygiene"
+C_MARKINGS = "markings preserved"
 #: The rubric, in the order every report and batch column reads it. These
 #: numbers were duplicated in task.toml, which a Harbor verifier container
 #: never sees -- so the harness already carried them against exactly that
@@ -205,6 +215,15 @@ ALL_CRITERIA = {
     "no new control interference": 0.5,
     "left-handed layout achieved": 2.0,
     "no unrequested changes": 0.5,
+    # instruction.md: "any text, logos, and standard/purchased parts (e.g.
+    # joystick caps) must remain legible and correctly oriented". The
+    # naive-flip guard inside `left-handed layout achieved` reads the
+    # "correctly oriented" half. This reads the "remain" half, which had no
+    # reader at all -- a candidate could erase all four face-button symbols
+    # and score 7.000. Its own criterion rather than a component of `no
+    # unrequested changes`, which is worth 0.5 in total and cannot express
+    # this without being re-weighted itself; max_score becomes 8.0.
+    C_MARKINGS: 1.0,
 }
 GEOMETRY_CRITERIA = tuple(k for k in ALL_CRITERIA
                           if k not in (C_HEALTH, C_HYGIENE))
@@ -326,9 +345,19 @@ HANDEDNESS_POSITIVE = {"cluster_sides": 0.6, "body_chirality": 0.4}
 # (weighted_evidence renormalises over what is readable), instead of the class
 # going wholly unreadable and falling back to NEUTRAL_UNVERIFIABLE -- which
 # paid a candidate MORE for destroying the evidence than for being caught.
-HANDEDNESS_GUARD = {"port_lights_side": 0.5,
-                    "housing_detail_side": 0.3,
-                    "housing_side_signature": 0.2}
+#: THE GUARD IS TWO WITNESSES, NOT THREE. `housing_detail_side` used to
+#: carry 0.3 here on the reasoning that a naive whole-part mirror drags the
+#: engraved labels across the plane with everything else. It does -- and so
+#: does a correct conversion, because instruction.md asks for the
+#: START/SELECT labels to "end up in mirrored positions". Measured on this
+#: corpus the naive-flip adversary reads +0.1901 and the reference +0.2025:
+#: the two the guard exists to separate are indistinguishable on it, while
+#: the only model it passed was the one that never converted the controller
+#: at all. Area balance cannot tell a relocated label from a mirrored one;
+#: only orientation can, and it does not measure orientation. It is still
+#: computed and reported -- see DETAIL_SIDE_IS_DIAGNOSTIC -- with no weight.
+HANDEDNESS_GUARD = {"port_lights_side": 0.7,
+                    "housing_side_signature": 0.3}
 # Fraction of positive credit a naive whole-part flip keeps.  Non-zero
 # because such a candidate did produce a left-handed layout; small because
 # instruction.md names this failure explicitly.
@@ -343,6 +372,14 @@ RIGID_FLOOR = 0.5
 # right", or destroying the evidence becomes a winning strategy.
 NEUTRAL_UNVERIFIABLE = 0.5
 
+#: Fraction of the seed's face-button engraving a candidate must keep for
+#: full marks on C_MARKINGS. Every model in this corpus that keeps its
+#: symbols keeps 50 of 50 faces and every model that does not keeps 0, so
+#: nothing in the data forces a particular value; 0.75 leaves room for a
+#: candidate that re-cuts the symbols with slightly different topology
+#: without leaving room for one that removes them.
+MARKINGS_FULL_FRACTION = 0.75
+
 # body-volume windows (m^3) used by role assignment
 BUTTON_VOL_MIN = 0.4e-6
 BUTTON_VOL_MAX = 5.0e-6
@@ -356,6 +393,15 @@ SMALL_FACE_AREA = 15e-6         # arrow/glyph engraving faces (dpad witness)
 # from ~1 upwards is safely clear of measurement noise while still refusing
 # to call a dead heat.
 CLUSTER_ID_MIN_SEP = 1.0
+
+#: HOW DIFFERENT TWO BUTTON DIAMONDS MUST LOOK to be called different
+#: clusters, as the largest relative difference among (plan aspect, plan
+#: footprint, diamond radius).  Measured across this corpus: the seed's own
+#: two clusters are 0.337 apart, every correctly matched pair is within
+#: 0.014, every mismatched pair is at least 0.675, and the models that lost
+#: a cluster sit at exactly 0.000.  0.10 is 7x the worst match and 6.7x
+#: below the best mismatch.
+CLUSTER_SHAPE_MIN_SEP = 0.10
 
 # port-light glyph cluster constants
 LIGHT_FACE_MAX_AREA = 8e-6
@@ -467,8 +513,43 @@ def weighted_role_mean(scores_by_role, default=1.0):
 # role assignment (pure geometry)
 # --------------------------------------------------------------------------
 
-def sym_plane(bodies):
-    """Mirror plane x from the mode of same-fingerprint pair midpoints."""
+#: How far apart two pair-midpoints may be and still be called the same
+#: plane. Was implicit in `round(p * 1000)` plus a +-1.5 mm membership
+#: window, which are not the same number and disagreed at bucket edges.
+PLANE_WINDOW_MM = 1.5
+
+
+def sym_plane(bodies, expected=None):
+    """Mirror plane x from the mode of same-fingerprint pair midpoints.
+
+    DETERMINISTIC, WHICH IT WAS NOT. The old body was
+
+        buckets = Counter(round(p * 1000) for p in planes)
+        best = buckets.most_common(1)[0][0]
+
+    and `Counter.most_common` breaks ties by INSERTION ORDER. Insertion
+    order here is `itertools.combinations(bodies, 2)`, so it is the order
+    SolidWorks handed the bodies back -- which is not stable across
+    opens. Measured on 27.09: the same .SLDPRT captured twice in one
+    batch gave plane_x_m 0.13795 and 0.08059 (the part's real plane is
+    0.0805). Everything plane-relative is then measured about the wrong
+    mirror, and `clusters at mirrored positions` went 1.00 -> 0.00 --
+    1.5 of 7.0, on identical geometry, run to run.
+
+    Three changes, all of them about making the same input give the same
+    answer:
+
+      * each candidate plane is scored by HOW MANY midpoints fall within
+        PLANE_WINDOW_MM of it, not by how many share its 1 mm bucket. A
+        plane sitting on a bucket edge used to have its own support split
+        between two buckets and could lose to a spurious cluster.
+      * ties are broken by the value itself (and by distance to
+        `expected` when a baseline plane is known), never by the order
+        the pairs arrived in.
+      * `expected` only orders ties. It cannot invent a plane the
+        geometry does not support, so a part whose mirror genuinely
+        moved is still measured where it actually is.
+    """
     planes = []
     for a, b in itertools.combinations(bodies, 2):
         if abs(a["volume_m3"] - b["volume_m3"]) > 1e-9:
@@ -481,9 +562,22 @@ def sym_plane(bodies):
         planes.append((ca[0] + cb[0]) / 2)
     if not planes:
         return None
-    buckets = Counter(round(p * 1000) for p in planes)
-    best = buckets.most_common(1)[0][0]
-    members = [p for p in planes if abs(p * 1000 - best) <= 1.5]
+    planes.sort()
+    win = PLANE_WINDOW_MM / 1000.0
+
+    def support(p):
+        return sum(1 for q in planes if abs(q - p) <= win)
+
+    def rank(p):
+        # -support first; then nearest to the expected plane when one is
+        # known; then the value, so equal candidates always order the
+        # same way whatever order the pairs arrived in.
+        return (-support(p),
+                abs(p - expected) if expected is not None else 0.0,
+                p)
+
+    best = min(planes, key=rank)
+    members = [q for q in planes if abs(q - best) <= win]
     return sum(members) / len(members)
 
 
@@ -509,6 +603,29 @@ def _diamond_groups(small):
     return groups
 
 
+def _diamond_plan_shape(group):
+    """(mean plan aspect, mean plan footprint mm2) of a four-body diamond.
+
+    Plan, not volume: the reference rescales the buttons, and aspect and
+    footprint in the XZ plane are what survive that. A body without a
+    bounding box contributes an aspect of 1.0, which sorts it with the
+    round buttons rather than inventing an elongation for it.
+    """
+    asp, foot = [], []
+    for b in group:
+        bb = b.get("bbox_m")
+        if not bb or len(bb) < 6:
+            asp.append(1.0)
+            foot.append(0.0)
+            continue
+        dx, dz = abs(bb[3] - bb[0]) * MM, abs(bb[5] - bb[2]) * MM
+        lo, hi = sorted((dx, dz))
+        asp.append(hi / lo if lo > 0 else 1.0)
+        foot.append(dx * dz)
+    n = len(group) or 1
+    return (sum(asp) / n, sum(foot) / n)
+
+
 def assign_roles(bodies, small_face_count):
     """{role: [ids]} from geometry alone."""
     roles = {}
@@ -523,15 +640,33 @@ def assign_roles(bodies, small_face_count):
     small = [b for b in bodies
              if BUTTON_VOL_MIN < b["volume_m3"] < BUTTON_VOL_MAX]
     diamonds = [g for g in _diamond_groups(small) if len(g) == 4]
-    # The d-pad is the diamond carrying more small engraved faces (its arrows).
-    # The x-centroid is a tie-break, and it matters: when a candidate has
-    # flattened that engraving -- or dropped a copy of one cluster where the
-    # other belonged -- the primary key ties, and without a second key the
-    # labels would fall out of SolidWorks' body enumeration order, which is
-    # not stable. The grader does not trust these labels under a tie; see
-    # Grader._resolve_button_clusters(). The tie-break exists so the capture
-    # itself is reproducible.
-    diamonds.sort(key=lambda g: (-sum(small_face_count.get(b["id"], 0)
+    # THE D-PAD IS THE MORE ELONGATED DIAMOND, not the more engraved one.
+    #
+    # It used to be the one carrying more small engraved faces -- its arrows
+    # -- which is a property of the seed rather than of a controller, and it
+    # inverts the moment the round buttons are engraved. The grader
+    # re-decides a CANDIDATE's labels by plan shape and could afford to
+    # ignore this ordering, but the BASELINE is never re-resolved: Broles
+    # comes straight out of prompt/input.json and is what every candidate's
+    # clusters are positioned against. A seed frozen with its labels crossed
+    # would measure every candidate against the wrong cluster.
+    #
+    #     d-pad arm     plan 13.8 x 17.0 mm   aspect 1.23   footprint 234 mm2
+    #     round button  plan 18.8 x 18.8 mm   aspect 1.00   footprint 353 mm2
+    #
+    # A cross arm is a rectangle in plan; a round button's bounding box is
+    # square by construction. Neither depends on what is engraved on it.
+    #
+    # Engraving and x-centroid are kept BELOW the shape keys. When the two
+    # diamonds really are the same shape -- a candidate that dropped a copy
+    # of one cluster where the other belonged -- the shape keys tie and
+    # those still decide, so the capture stays reproducible instead of
+    # falling out of SolidWorks' body enumeration order, which is not
+    # stable. The grader does not trust a tied label either way; see
+    # Grader._resolve_button_clusters().
+    diamonds.sort(key=lambda g: (-round(_diamond_plan_shape(g)[0], 3),
+                                 round(_diamond_plan_shape(g)[1], 1),
+                                 -sum(small_face_count.get(b["id"], 0)
                                       for b in g) / len(g),
                                  sum(b["centroid_m"][0] for b in g) / len(g)))
     if len(diamonds) >= 2:
@@ -825,9 +960,33 @@ def capture(doc, baseline=None, plane_x=None):
     #
     # Sanity-checked before use: a plane outside the part's own X extent is a
     # mis-detection, not a translation, and the baseline is used instead.
-    measured_plane = sym_plane(bodies)
+    # The baseline's plane, carried forward by however far the part has
+    # been translated. A legitimate edit may reset the origin, so the
+    # plane is allowed to travel WITH the part -- what it may not do is
+    # wander inside a part that has not moved.
+    expected_plane = None
+    bbb = ((baseline or {}).get("global") or {}).get("bbox_m")
+    if baseline and baseline.get("plane_x_m") is not None:
+        expected_plane = baseline["plane_x_m"]
+        if bbb and len(bbb) >= 4:
+            shift = ((gmin[0] + gmax[0]) / 2.0
+                     - (float(bbb[0]) + float(bbb[3])) / 2.0)
+            expected_plane += shift
+    measured_plane = sym_plane(bodies, expected=expected_plane)
+
+    # SANITY, AND THE OLD ONE WAS NOT ONE. "inside the part's own X
+    # extent" accepted 137.95 mm on a part 323 mm wide -- every
+    # mis-detection this task has ever produced passes that test. A plane
+    # that has slipped is one that sits far from where the seed's plane
+    # travelled to, on a part whose bounding box says it did not travel
+    # that far.
     usable = (measured_plane is not None
               and gmin[0] <= measured_plane <= gmax[0])
+    plane_slip_mm = None
+    if usable and expected_plane is not None:
+        plane_slip_mm = (measured_plane - expected_plane) * MM
+        if abs(plane_slip_mm) > PLANE_SLIP_MAX_MM:
+            usable = False
     P = plane_x if plane_x is not None else None
     plane_source = "argument"
     if P is None:
@@ -836,7 +995,13 @@ def capture(doc, baseline=None, plane_x=None):
         elif baseline and baseline.get("plane_x_m") is not None:
             P, plane_source = baseline["plane_x_m"], "baseline"
             if measured_plane is not None:
-                plane_source = "baseline (measured plane outside part extent)"
+                plane_source = (
+                    f"baseline (measured plane slipped "
+                    f"{plane_slip_mm:+.1f} mm from the seed's, "
+                    f"past the {PLANE_SLIP_MAX_MM:.0f} mm limit)"
+                    if plane_slip_mm is not None
+                    and abs(plane_slip_mm) > PLANE_SLIP_MAX_MM
+                    else "baseline (measured plane outside part extent)")
         else:
             plane_source = "undetermined"
 
@@ -1055,11 +1220,13 @@ class Grader:
     def _cluster_signature(self, capture, roles, role):
         """Mean small engraved faces per body of a button diamond.
 
-        This is the only thing that tells a d-pad from a face-button cluster
-        without reading a name: the arrows cut into the d-pad add small faces
-        the round buttons do not have. It survives a remodel -- the reference
-        rebuilds both clusters and keeps the separation -- because it counts
-        a design feature, not a specific face.
+        NO LONGER USED FOR IDENTITY -- see _cluster_shape(). It used to be,
+        on the reasoning that the arrows cut into the d-pad add small faces
+        the round buttons do not have; that is true of the seed and false of
+        the reference, which engraves the four glyphs on the buttons and
+        simplifies the arrows, inverting the key. It is reported beside the
+        shape because it remains the witness that separates `missing_glyphs`
+        from a model that kept its glyphs.
         """
         ids = roles.get(role) or []
         if not ids:
@@ -1073,6 +1240,60 @@ class Grader:
         if any(i not in smf for i in ids):
             return None
         return sum(smf[i] for i in ids) / len(ids)
+
+    def _cluster_shape(self, bodies, roles, role):
+        """(plan aspect, plan footprint mm2, diamond radius mm), or None.
+
+        WHAT THE ENGRAVING COUNT WAS STANDING IN FOR. `_cluster_signature`
+        identified the d-pad as the diamond with more small engraved faces.
+        That held for the seed, where the arrows are cut into the d-pad and
+        the round buttons are bare -- and it inverted the moment a candidate
+        engraved the four glyphs on the buttons, which is what the reference
+        does.  The reference's buttons read 15/11/0/24 small faces against
+        its d-pad's 5/5/5/5, so the d-pad was labelled `face_buttons`, the
+        clusters looked unmoved, and a model that performed the swap scored
+        4.300 of 7.0 for it.
+
+        Shape does not invert.  A d-pad arm is a rectangle in plan, 13.8 by
+        17.0 mm, aspect 1.23; a round button's bounding box is square by
+        construction, 18.8 by 18.8, aspect 1.00 and half again the
+        footprint.  Nothing engraved on a face changes either, and nothing
+        this task asks for does: widening moves the clusters apart, it does
+        not reshape a button.
+
+        Returned as a vector rather than a scalar so the caller can MATCH
+        against the seed instead of thresholding.  A candidate that rebuilds
+        both clusters at a different size still matches the seed's pairing
+        correctly; an absolute cut-off would not survive that.
+        """
+        ids = roles.get(role) or []
+        if len(ids) < 2:
+            return None
+        bs = [bodies.get(i) for i in ids]
+        if any(b is None or not b.get("bbox_m") for b in bs):
+            return None
+        cx = sum(b["centroid_m"][0] for b in bs) / len(bs)
+        cz = sum(b["centroid_m"][2] for b in bs) / len(bs)
+        rad = sum(math.hypot(b["centroid_m"][0] - cx,
+                             b["centroid_m"][2] - cz) for b in bs) / len(bs)
+        asp, foot = [], []
+        for b in bs:
+            bb = b["bbox_m"]
+            dx, dz = (bb[3] - bb[0]) * MM, (bb[5] - bb[2]) * MM
+            lo, hi = sorted((abs(dx), abs(dz)))
+            if lo <= 0:
+                return None
+            asp.append(hi / lo)
+            foot.append(abs(dx * dz))
+        return (sum(asp) / len(asp), sum(foot) / len(foot), rad * MM)
+
+    @staticmethod
+    def _shape_dist(a, b):
+        """Largest relative difference between two cluster shapes."""
+        if a is None or b is None:
+            return None
+        return max(abs(x - y) / max(abs(x), abs(y), 1e-9)
+                   for x, y in zip(a, b))
 
     def _cluster_centre_x(self, ids):
         return sum(self.C[i]["centroid_m"][0] for i in ids) / len(ids)
@@ -1121,30 +1342,63 @@ class Grader:
         if not all(self.Broles.get(r) for r in roles):
             return None
 
+        bsh = {r: self._cluster_shape(self.B, self.Broles, r)
+               for r in roles}
+        csh = {r: self._cluster_shape(self.C, self.Croles, r)
+               for r in roles}
+        if any(v is None for v in list(bsh.values()) + list(csh.values())):
+            return None
+
+        seed_sep = self._shape_dist(bsh["dpad"], bsh["face_buttons"])
+        cand_sep = self._shape_dist(csh["dpad"], csh["face_buttons"])
+
+        # Kept as evidence, no longer as identity.  It is still what tells
+        # `missing_glyphs` from the reference; it is simply not what tells a
+        # d-pad from a button, because a candidate is free to engrave the
+        # buttons and the reference does.
         bsig = {r: self._cluster_signature(self.bl, self.Broles, r)
                 for r in roles}
         csig = {r: self._cluster_signature(self.ms, self.Croles, r)
                 for r in roles}
-        if any(v is None for v in list(bsig.values()) + list(csig.values())):
-            return None
 
-        seed_sep = abs(bsig["dpad"] - bsig["face_buttons"])
-        cand_sep = abs(csig["dpad"] - csig["face_buttons"])
-        out = {"seed_signature": {r: round(bsig[r], 3) for r in roles},
-               "candidate_signature": {r: round(csig[r], 3) for r in roles},
+        def _sh(v):
+            return {"plan_aspect": round(v[0], 3),
+                    "plan_footprint_mm2": round(v[1], 1),
+                    "diamond_radius_mm": round(v[2], 2)}
+
+        out = {"seed_shape": {r: _sh(bsh[r]) for r in roles},
+               "candidate_shape": {r: _sh(csh[r]) for r in roles},
                "seed_separation": round(seed_sep, 3),
                "candidate_separation": round(cand_sep, 3),
-               "min_separation": CLUSTER_ID_MIN_SEP}
+               "min_separation": CLUSTER_SHAPE_MIN_SEP,
+               "engraved_faces_per_body": {
+                   "seed": {r: (None if bsig[r] is None else round(bsig[r], 2))
+                            for r in roles},
+                   "candidate": {r: (None if csig[r] is None
+                                     else round(csig[r], 2)) for r in roles},
+                   "note": "reported, not used for identity: a candidate may "
+                           "engrave the face buttons, and the reference "
+                           "does, which inverts this key"}}
 
-        if seed_sep < CLUSTER_ID_MIN_SEP:
+        if seed_sep < CLUSTER_SHAPE_MIN_SEP:
             out["verdict"] = "seed_indistinct"
-            out["note"] = ("the seed's own button clusters carry the same "
-                           "engraving signature, so identity cannot be "
-                           "measured for either part; labels left as found")
+            out["note"] = ("the seed's own button clusters have the same "
+                           "plan shape, so identity cannot be measured for "
+                           "either part; labels left as found")
             return out
 
-        if cand_sep >= CLUSTER_ID_MIN_SEP:
-            if csig["dpad"] < csig["face_buttons"]:
+        if cand_sep >= CLUSTER_SHAPE_MIN_SEP:
+            # Both assignments are priced against the seed and the cheaper
+            # one wins.  No absolute cut-off: a candidate that rebuilds both
+            # clusters at a different size still pairs up correctly.
+            keep = (self._shape_dist(csh["dpad"], bsh["dpad"])
+                    + self._shape_dist(csh["face_buttons"],
+                                       bsh["face_buttons"]))
+            swap = (self._shape_dist(csh["dpad"], bsh["face_buttons"])
+                    + self._shape_dist(csh["face_buttons"], bsh["dpad"]))
+            out["match_cost"] = {"as_labelled": round(keep, 3),
+                                 "swapped": round(swap, 3)}
+            if swap < keep:
                 self.Croles["dpad"], self.Croles["face_buttons"] = (
                     self.Croles["face_buttons"], self.Croles["dpad"])
                 out["relabelled"] = True
@@ -1153,8 +1407,9 @@ class Grader:
 
         # Dead heat on the candidate. Which seed role do both diamonds look
         # like? The other one is the one that is missing.
-        common = (csig["dpad"] + csig["face_buttons"]) / 2.0
-        survivor = min(roles, key=lambda r: abs(bsig[r] - common))
+        common = tuple((csh["dpad"][i] + csh["face_buttons"][i]) / 2.0
+                       for i in range(3))
+        survivor = min(roles, key=lambda r: self._shape_dist(bsh[r], common))
         missing = [r for r in roles if r != survivor][0]
 
         exp = self._expected_cluster_x(survivor)
@@ -1168,8 +1423,9 @@ class Grader:
         out["survivor"] = survivor
         out["missing"] = missing
         out["note"] = (
-            f"the candidate's two button diamonds carry the same engraving "
-            f"signature ({round(common, 3)}), which matches the seed's "
+            f"the candidate's two button diamonds have the same plan shape "
+            f"(aspect {round(common[0], 3)}, footprint "
+            f"{round(common[1], 1)} mm2), which matches the seed's "
             f"{survivor}; the seed separates its clusters by "
             f"{round(seed_sep, 3)}. The {missing} is therefore absent as a "
             f"distinct cluster and is scored as an unmatched role. The "
@@ -1754,16 +2010,36 @@ class Grader:
                                   "favours either side -- markings removed "
                                   "or flattened, so the side cannot be read")
             else:
-                same = (ba * ca) > 0
-                e_detail = 1.0 if same else 0.0
-                entry3["score"] = e_detail
-                entry3["status"] = PASS if same else FAIL
-                entry3["note"] = ("area-weighted left/right balance of "
-                                  "engraving-scale housing faces. Survives "
-                                  "the re-shell that makes "
-                                  "housing_side_signature unreadable, "
-                                  "because a re-shell adds large faces and "
-                                  "this filter keeps only small ones.")
+                # DETAIL_SIDE_IS_DIAGNOSTIC. The old rule was
+                # `same = (ba * ca) > 0` scored 1.0 -- the engraved detail
+                # must stay on its side -- and it is backwards here:
+                # instruction.md asks for the START/SELECT labels to end up
+                # in mirrored positions, and those labels ARE the
+                # engraving-scale housing faces this measures. It passed one
+                # model in the corpus, the one that never converted the
+                # controller, and failed every model that did.
+                #
+                # Kept, with its polarity corrected to what it actually
+                # shows, and with no weight: `moved` is what the task asks
+                # for. Not promoted to positive evidence either, because as
+                # a signal it says what cluster_sides already says and those
+                # weights are calibrated.
+                moved = (ba * ca) < 0
+                e_detail = None
+                entry3["score"] = None
+                entry3["moved_to_other_side"] = moved
+                entry3["status"] = UNVERIFIABLE
+                entry3["note"] = ("DIAGNOSTIC ONLY, CARRIES NO WEIGHT. "
+                                  "Area-weighted left/right balance of "
+                                  "engraving-scale housing faces -- the "
+                                  "START/SELECT labels among them. A sign "
+                                  "flip means they crossed the plane, which "
+                                  "instruction.md requires, so this cannot "
+                                  "guard against a naive mirror: both move "
+                                  "them. Measured, the naive-flip adversary "
+                                  "and the reference read +0.19 and +0.20. "
+                                  "port_lights_side is what separates those "
+                                  "two.")
         checks["housing_detail_side"] = entry3
 
         checks["symbol_glyphs"] = {
@@ -1783,11 +2059,12 @@ class Grader:
             "cluster_sides": (HANDEDNESS_POSITIVE["cluster_sides"], e_sides),
             "body_chirality": (HANDEDNESS_POSITIVE["body_chirality"], e_chir),
         })
+        # e_detail is deliberately absent: see DETAIL_SIDE_IS_DIAGNOSTIC and
+        # the note on HANDEDNESS_GUARD. It is measured, reported, and worth
+        # nothing here, because on this task it fires on the correct answer.
         guard, guard_diag = weighted_evidence({
             "port_lights_side": (HANDEDNESS_GUARD["port_lights_side"],
                                  e_lights),
-            "housing_detail_side": (
-                HANDEDNESS_GUARD["housing_detail_side"], e_detail),
             "housing_side_signature": (
                 HANDEDNESS_GUARD["housing_side_signature"], e_sig),
         })
@@ -1809,6 +2086,99 @@ class Grader:
                 "low_confidence": low_conf,
                 "checks": checks,
                 "match_hypotheses": self.match_diag}
+
+    # -- c7 ------------------------------------------------------------
+    def c7_markings(self):
+        """Did the face-button symbols survive the edit?
+
+        instruction.md asks for text and logos to REMAIN legible. Nothing
+        read the "remain": `adversarial_missing_glyphs` is the reference
+        with the four symbols removed and nothing else touched, and it
+        scored full marks.
+
+        Counted on the engraving-scale faces of the round-button cluster,
+        after `_resolve_button_clusters()` has settled which cluster that
+        is. The seed's four buttons carry 0, 11, 15 and 24 such faces --
+        the symbols differ, so their face counts differ -- and every model
+        in this corpus reproduces that multiset exactly or carries none at
+        all. 50 against 0; the fraction retained is what is scored, with
+        full marks from MARKINGS_FULL_FRACTION so a candidate that re-cuts
+        the symbols differently is not punished for the difference.
+
+        THE D-PAD ARROWS ARE NOT COUNTED. The seed's cross carries 44
+        engraved faces, 11 a limb, and every model that performed the
+        conversion carries 20, 5 a limb: the reference simplifies the
+        arrows when it rebuilds the cross and the adversaries inherit
+        that. There is no signal in it, only a way to take marks off every
+        model including the reference. Reported below, not scored.
+        """
+        smf_b = self.bl.get("small_face_counts") or {}
+        smf_c = self.ms.get("small_face_counts") or {}
+        bids = self.Broles.get("face_buttons") or []
+        cids = self.Croles.get("face_buttons") or []
+
+        def census(ids, smf):
+            if not ids or any(i not in smf for i in ids):
+                return None
+            return [smf[i] for i in ids]
+
+        b_faces = census(bids, smf_b)
+        c_faces = census(cids, smf_c)
+
+        # The d-pad, for the report only.
+        arrows = {"seed": census(self.Broles.get("dpad") or [], smf_b),
+                  "candidate": census(self.Croles.get("dpad") or [], smf_c),
+                  "note": "NOT SCORED -- the reference rebuilds the cross "
+                          "and simplifies its arrows (44 faces in the seed, "
+                          "20 in every converted model), so this separates "
+                          "nothing and would charge the reference for it."}
+
+        if b_faces is None or not sum(b_faces):
+            return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
+                    "detail": {"seed_engraved_faces": b_faces,
+                               "dpad_arrows": arrows},
+                    "evidence": "the seed's face buttons carry no engraving, "
+                                "so there is nothing to preserve and this "
+                                "cannot be measured either way",
+                    "caveat": "scored NEUTRAL_UNVERIFIABLE, not full marks: "
+                              "an unreadable witness must not pay better "
+                              "than a readable one that half passes."}
+
+        b_total = sum(b_faces)
+        if c_faces is None:
+            return {"score": 0.0, "status": FAIL,
+                    "detail": {"seed_engraved_faces": b_faces,
+                               "candidate_engraved_faces": None,
+                               "dpad_arrows": arrows},
+                    "evidence": f"the seed's face buttons carry {b_total} "
+                                f"engraving-scale faces; the candidate has "
+                                f"no face-button cluster to read them on"}
+
+        c_total = sum(c_faces)
+        retained = c_total / float(b_total)
+        score = clamp01(retained / MARKINGS_FULL_FRACTION)
+        return {"score": round(score, 4), "status": status_of(score),
+                # NUMBERS ONLY IN `components`: summarise() prints each one
+                # through a float format, so a list here raises TypeError at
+                # the end of an otherwise complete grade.  The per-body
+                # censuses live in `detail`.
+                "components": {"retained_fraction": round(retained, 4),
+                               "full_marks_from": MARKINGS_FULL_FRACTION},
+                "detail": {"seed_engraved_faces": sorted(b_faces),
+                           "candidate_engraved_faces": sorted(c_faces),
+                           "seed_total": b_total,
+                           "candidate_total": c_total,
+                           "dpad_arrows": arrows},
+                "evidence": f"face-button engraving: {c_total} of the seed's "
+                            f"{b_total} engraving-scale faces retained "
+                            f"({retained:.0%})",
+                "caveat": "counts engraving-scale faces on the round-button "
+                          "cluster, which is where the four PS symbols are "
+                          "cut.  It reads PRESENCE, not orientation -- the "
+                          "symbols are left-right symmetric, so a mirrored "
+                          "symbol is geometrically identical to an upright "
+                          "one and is the naive-flip guard's business, not "
+                          "this criterion's."}
 
     # -- c5 ------------------------------------------------------------
     def c5_unrequested(self):
@@ -1856,7 +2226,70 @@ class Grader:
         det["worst_fingerprint_drift"] = round(worst_fp, 5)
         det["reshaped"] = reshaped
 
-        score = 0.5 * span + 0.5 * shape
+        # 5.3 -- REPORTED, NOT CHARGED: what the exemption hides.
+        #
+        # The exemption above is load-bearing and correct -- the reference
+        # really does remodel the housing and the diamonds, so their
+        # shape cannot be compared against the seed's. It is also a door,
+        # and `adversarial_unrequested_change_elsewhere` walks through it:
+        # it is the reference plus one small cut on the housing, scores
+        # 7.000 of 7.0, and every criterion is right to give it full
+        # marks, because every criterion is measuring something else.
+        #
+        # NO THRESHOLD IS SET, and that is a measured decision rather than
+        # timidity. Across this corpus the housing runs 185 676 to
+        # 1 515 892 mm3, its face count 522 to 810, the tree 58 to 65
+        # sketches and 199 to 284 features. The model named for the
+        # unrequested change sits at 810 faces / 64 sketches / 280
+        # features -- and `adversarial_widened_by_30mm`, whose defect is
+        # something else entirely, sits above it at 799 / 65 / 284. A
+        # cut-off that catches the first flags the second. These are
+        # authored models, not one author's variations, and their trees
+        # have no common scale.
+        #
+        # So the numbers are printed where the score is, and the score is
+        # left alone. A 7.000 that also says "three features and nine
+        # faces the seed does not have" is not the same artefact as a
+        # bare 7.000, and the next person should not have to diff two
+        # captures by hand to learn it.
+        seed_m = (self.bl.get("modelling") or {})
+        cand_m = (self.ms.get("modelling") or {})
+
+        def _n(d, *path):
+            for k in path:
+                d = (d or {}).get(k)
+            return d
+
+        seed_faces = _n(self.bl, "housing_signature", "faces")
+        cand_faces = _n(self.ms, "housing_signature", "faces")
+        tf = {"note": "diagnostic only -- not scored. The reshape check "
+                      "cannot see inside an exempt body, so these are the "
+                      "only trace an unrequested edit there leaves. They "
+                      "carry no threshold: this corpus's trees differ too "
+                      "much between authors for one to be honest.",
+              "housing_faces": {"seed": seed_faces, "got": cand_faces},
+              "sketches": {"seed": _n(seed_m, "sketches", "count"),
+                           "got": _n(cand_m, "sketches", "count")},
+              "features_scanned": {
+                  "seed": _n(seed_m, "suppressed", "features_scanned"),
+                  "got": _n(cand_m, "suppressed", "features_scanned")}}
+        for k in ("housing_faces", "sketches", "features_scanned"):
+            a, b = tf[k]["seed"], tf[k]["got"]
+            tf[k]["delta"] = (b - a) if isinstance(a, int) \
+                and isinstance(b, int) else None
+        det["tree_and_faces"] = tf
+
+        # THE WEAKER HALF DECIDES, NOT THE AVERAGE. This was
+        # `0.5 * span + 0.5 * shape`, and the average is the wrong shape for
+        # a constraint: `yz_spans` is 1.000 for every candidate that did not
+        # resize the whole part, so it held the criterion at 0.500 however
+        # badly a body was reshaped. Measured by simulation on the
+        # reference's own capture, cutting a trigger by 18.6% of its volume
+        # moved this criterion from 1.000 to 0.500 and the total from 8.000
+        # to 7.750 -- a quarter of a point, the most an unrequested change
+        # could ever cost. Either half failing means an unrequested change
+        # was made, so the criterion now reports the one that failed.
+        score = min(span, shape)
         return {"score": round(score, 4), "status": status_of(score),
                 "components": {"yz_spans": round(span, 4),
                                "body_shapes": round(shape, 4)},
@@ -1864,7 +2297,11 @@ class Grader:
                 "caveat": "housing, button diamonds and centre buttons are "
                           "exempt from the reshape check -- the reference "
                           "remodels them.  Sticks/triggers/bumpers must keep "
-                          "their shape.  Scored by weight, not as a gate."}
+                          "their shape.  Scored by weight, not as a gate.  "
+                          "AN UNREQUESTED EDIT INSIDE AN EXEMPT BODY IS NOT "
+                          "CAUGHT HERE: see detail.tree_and_faces for the "
+                          "trace it leaves, and DATASET_ISSUES for why it "
+                          "is reported rather than charged."}
 
     # -- assemble --------------------------------------------------------
     def grade(self):
@@ -1950,6 +2387,7 @@ class Grader:
         report["criteria"][names[2]] = self.c3_interference()
         report["criteria"][names[3]] = self.c4_handedness()
         report["criteria"][names[4]] = self.c5_unrequested()
+        report["criteria"][C_MARKINGS] = self.c7_markings()
 
         # A plane the harness had to borrow from the baseline means the
         # part's own symmetry could not be read; sidedness rests on an
@@ -2096,6 +2534,21 @@ def grade_candidate(path=None, close_after=False, weights=None):
     baseline = load_baseline()
     measured = measure_candidate(path, close_after=close_after,
                                  baseline=baseline)
+    # KEEP THE MEASUREMENT WHEN THE RUNNER ASKED FOR IT.
+    #
+    # `harness_cli._run_child` sets HARNESS_CAPTURE_JSON for every model of
+    # a `--batch` grade run, and `batch_grade` explains itself: "Grading
+    # keeps the capture. Measuring a corpus costs an hour of CAD and used to
+    # leave nothing behind to re-score." This harness never read the
+    # variable. It wrote HARNESS_REPORT_JSON and dropped the capture, so a
+    # nine-model run left nine reports and no way to score any of them
+    # again without re-opening SolidWorks nine times.
+    #
+    # Same shape as `--capture-only` writes, because `--score-from` reads
+    # them back interchangeably and a capture that is nearly the right
+    # shape is worse than none.
+    write_env("HARNESS_CAPTURE_JSON",
+              json.dumps(measured, indent=1, default=str))
     return score_capture(measured, baseline=baseline, weights=weights)
 
 
@@ -2185,7 +2638,7 @@ def capture_baseline(path, out_path=None):
     raw, bodies, boxes, gmin, gmax = SC.capture_bodies(doc)
     smf = _small_face_counts(raw)
     roles = assign_roles(bodies, smf)
-    plane = sym_plane(bodies)
+    plane = sym_plane(bodies)   # no baseline yet: pure geometry
     if plane is None:
         raise RuntimeError("could not determine the symmetry plane from this "
                            "part; refusing to write a baseline without one")
