@@ -15,9 +15,9 @@ program = "SolidWorks"
 category = "design_iteration"
 units = "mm"
 human_baseline_minutes = 240
-max_score = 4
+max_score = 7.0
 
-notes = "PS3 controller (replaces the retired Xbox variant, whose surfacing broke during the engineer's edit). Mirror plane is x=80.5mm, not x=0. Grading is geometry-only and id/name-independent: roles (housing/dpad/face_buttons/ sticks/triggers/bumpers/centre) are assigned geometrically per capture. Widen is graded as mirror-pair separation growth (+15mm), robust to the housing remodel. The naive-flip guard is the port-light glyph cluster (a one-sided housing feature re-found by its mirror-invariant area multiset; it must stay on its original side). PS symbol glyphs are left-right symmetric, so symbol chirality is UNVERIFIABLE by design. Harness grades the active SolidWorks document, or a path passed as argv[1]. Baseline frozen via `harness.py --capture-baseline prompt/input.SLDPRT`.\n"
+notes = "PS3 controller (replaces the retired Xbox variant, whose surfacing broke during the engineer's edit). Mirror plane is x=80.5mm, not x=0. Grading is geometry-only and id/name-independent: roles (housing/dpad/face_buttons/ sticks/triggers/bumpers/centre) are assigned geometrically per capture. Widen is graded as mirror-pair separation growth (+15mm), robust to the housing remodel. The naive-flip guard is the port-light glyph cluster (a one-sided housing feature re-found by its mirror-invariant area multiset; it must stay on its original side). PS symbol glyphs are left-right symmetric, so symbol chirality is UNVERIFIABLE by design. Harness grades the active SolidWorks document, or a path passed as argv[1]. Baseline frozen via `harness.py --capture-baseline prompt/input.SLDPRT`.\n\nSCORING IS CONTINUOUS. Every component returns a subscore in [0,1], not PASS/FAIL, so adversarial near-misses separate from each other instead of collapsing to zero. The harness reads these weights at run time (load_scoring_weights), so editing a weight here changes the grade.\n\nNo component is a score-zeroing gate, and the weights follow the shape of the instruction rather than treating every criterion as equal. What the task ASKS FOR carries 5.0 of 7.0: 'widened by 15 mm' 1.5, 'clusters at mirrored positions' 1.5, 'left-handed layout achieved' 2.0 (heaviest -- it is the demand instruction.md's last sentence is about, and the one a candidate can satisfy geometrically while still getting wrong). What merely CONSTRAINS the edit carries 1.0: 'no new control interference' 0.5 and 'no unrequested changes' 0.5 -- both are passed by a candidate who did nothing at all, so they cannot be worth as much as the edits themselves. Model preservation, which the task description does name, carries the remaining 1.0: 'rebuild health' 0.5 and 'modelling hygiene' 0.5. The practical consequence is that an untouched seed scores 28.6%, not the 50% it collected when all five geometry components were equal. A tree that does not rebuild clean zeroes the five GEOMETRY components -- measurements from a broken rebuild are not trustworthy -- but health and hygiene are still scored, so 'one broken feature' and 'the tree is in ruins' no longer collapse onto the same total. All seven components are always emitted, so max_score stays constant and envelopes remain comparable across candidates.\n"
 output_modality = "cad"
 accepted_output_formats = ["sldprt"]
 reference = ["solution/solution.SLDPRT"]
@@ -39,15 +39,36 @@ path = "tests/task/prompt/input.json"
 format = "json"
 role = "baseline_measurements"
 
-[metadata.examples]
-"examples/adversarial_widened_15mm_clusters_at_original_spacing/adversarial_widened_15mm_clusters_at_original_spacing.SLDPRT" = "widened 15 mm but clusters left at original spacing"
-"examples/adversarial_unwidened_shell_with_correct_clusters/adversarial_unwidened_shell_with_correct_clusters.SLDPRT" = "clusters swapped correctly on an unwidened shell"
-"examples/adversarial_widened_by_30mm/adversarial_widened_by_30mm.SLDPRT" = "widened 30 mm instead of 15"
-"examples/adversarial_text_mirrored_incorrectly/adversarial_text_mirrored_incorrectly.SLDPRT" = "text mirrored incorrectly"
-"examples/adversarial_only_one_button_cluster_mirrored/adversarial_only_one_button_cluster_mirrored.SLDPRT" = "only one button cluster moved across"
-"examples/adversarial_missing_glyphs/adversarial_missing_glyphs.SLDPRT" = "widened and mirrored correctly but the button glyphs are missing"
-"examples/adversarial_unrequested_change_elsewhere/adversarial_unrequested_change_elsewhere.SLDPRT" = "correct edit plus an unrequested change elsewhere on the part"
-"examples/adversarial_feature_tree_with_errors/adversarial_feature_tree_with_errors.SLDPRT" = "feature tree riddled with rebuild errors and dangling references"
+# --- THE ADVERSARIAL THIS TASK NEEDS FOR A JUDGEMENT ---
+#
+# A judgement earns a weight only where two things hold at once: a
+# plausible submission could satisfy EVERY measurement this harness
+# makes and still fail what the task asked, AND the corpus holds a
+# model that does exactly that.
+#
+# The first condition holds on every task in this set. The second now
+# holds on four of them -- 60_sheet_metal_parts, 61_bolts_in_a_joint,
+# 62_nuts_and_bolts and 65_swivel_clamp each ship a model that passes
+# every deterministic tick and still fails the brief -- and those four
+# are the only tasks whose judged criterion carries a weight rather
+# than being reported at zero. Below is the model this task would
+# need, and the question it would settle.
+#
+#   the question  : Can the hand that holds this controller reach the clusters
+#                   where they now sit?
+#   the model     : adversarial_clusters_spaced_correctly_but_out_of_thumb_reach
+#   build         : The shell widened 15 mm, the clusters re-spaced to match
+#                   and swapped to the left-handed layout exactly as asked --
+#                   and slid outboard onto the grip shoulders, where the
+#                   spacing between them is still right and a thumb no longer
+#                   reaches the far buttons.
+#   what it shows : The widening, the spacing, the count and the mirrored
+#                   positions are all measured and all pass. Whether the
+#                   layout can be worked by the hands holding it is not a
+#                   dimension, and it is the first thing a person would say
+#                   about this model.
+#
+# --- end ---
 
 [[metadata.assets]]
 path = "environment/input.SLDPRT"

@@ -7,6 +7,145 @@ from common.solidworks_measure import z
 SW_SOLID_BODY = 0
 
 
+# ---------------------------------------------------------------------------
+# session entry
+# ---------------------------------------------------------------------------
+
+def attach_app():
+    """The SolidWorks application object, late-bound.
+
+    Always go through this rather than win32com.client.GetActiveObject:
+    that silently upgrades to early-bound dispatch once pywin32 has cached
+    makepy support for the SolidWorks typelib (which it does automatically
+    and persistently on the first successful attach on a machine), after
+    which any manual VARIANT(VT_BYREF, ...) call -- OpenDoc6's error and
+    warning byrefs among them -- fails with "TypeError: int() argument must
+    be ... not 'VARIANT'". Confirmed on the grading box 2026-08-15.
+    """
+    from common import solidworks_session as sws
+    return sws.attach()
+
+
+def open_or_active(app, path=None, doc_type=None):
+    """The document at `path`, or the active one when no path is given.
+
+    open_document sweeps the whole session closed before any fresh open.
+    Confirmed live on 30_shampoo_bottle that a multi-component assembly can
+    otherwise silently reuse a same-named component document left open by a
+    previous candidate. Sweeping also keeps the session from accumulating
+    open documents run over run.
+
+    doc_type defaults to inferring part/assembly from the file extension.
+    """
+    if path:
+        import os
+        from common import solidworks_session as sws
+        doc, _opened_here = sws.open_document(app, os.path.abspath(path),
+                                              doc_type=doc_type)
+        if doc is not None:
+            return doc
+    doc = app.ActiveDoc
+    if doc is None:
+        raise RuntimeError("no active SolidWorks document and no path given")
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# model-quality census
+# ---------------------------------------------------------------------------
+
+def modelling_census(doc):
+    """Model-quality facts that geometry alone does not expose.
+
+    Sketch constraint status, suppressed features, external references.
+    Every probe is optional: a SolidWorks build that does not expose one of
+    these must degrade the census, never abort the grade -- so each block
+    records what it managed to read and reports the rest as unavailable.
+
+    Sketch statuses are deliberately kept as RAW API values, for the caller
+    to compare against a seed distribution rather than interpret.  That keeps
+    the check correct without depending on the numeric meaning of
+    swSketchConstrainedStatus_e, which varies between API versions.
+    """
+    out = {"available": {}, "notes": []}
+
+    # -- sketches ------------------------------------------------------
+    status_counts, n_sketches = {}, 0
+    try:
+        feat = z(doc.FirstFeature)
+        while feat is not None:
+            try:
+                tname = str(z(feat.GetTypeName2))
+            except Exception:
+                tname = ""
+            if tname in ("ProfileFeature", "3DProfileFeature"):
+                n_sketches += 1
+                try:
+                    sk = z(feat.GetSpecificFeature2)
+                    st = int(z(sk.GetConstrainedStatus))
+                    status_counts[str(st)] = status_counts.get(str(st), 0) + 1
+                except Exception:
+                    status_counts["unreadable"] = \
+                        status_counts.get("unreadable", 0) + 1
+            feat = z(feat.GetNextFeature)
+        out["sketches"] = {"count": n_sketches, "status_counts": status_counts}
+        out["available"]["sketches"] = True
+    except Exception as exc:
+        out["available"]["sketches"] = False
+        out["notes"].append(f"sketch census unavailable: {exc}")
+
+    # -- suppressed features -------------------------------------------
+    try:
+        suppressed, n_feat = [], 0
+        feat = z(doc.FirstFeature)
+        while feat is not None:
+            n_feat += 1
+            try:
+                if bool(z(feat.IsSuppressed)):
+                    suppressed.append(str(feat.Name))
+            except Exception:
+                pass
+            feat = z(feat.GetNextFeature)
+        out["suppressed"] = {"count": len(suppressed),
+                             "names": sorted(suppressed)[:25],
+                             "features_scanned": n_feat}
+        out["available"]["suppressed"] = True
+    except Exception as exc:
+        out["available"]["suppressed"] = False
+        out["notes"].append(f"suppression census unavailable: {exc}")
+
+    # -- external references -------------------------------------------
+    # Several API shapes exist across SolidWorks versions and none is
+    # guaranteed; try each and accept only a genuinely iterable result.
+    refs, how = None, None
+    ext = (lambda: doc.Extension)
+    own = (lambda: doc)
+    for owner, getter in ((ext, "ListExternalFileReferences"),
+                          (ext, "ListExternalFileReferences2"),
+                          (own, "GetDependencies2"),
+                          (own, "GetDependencies")):
+        try:
+            got = z(getattr(owner(), getter))
+            if got is None or isinstance(got, (str, bytes)):
+                continue
+            probe = list(got)          # raises if not really iterable
+            refs, how = probe, getter
+            break
+        except Exception:
+            continue
+    if refs is None:
+        out["available"]["external_refs"] = False
+        out["notes"].append("external reference census unavailable: no "
+                            "supported API on this SolidWorks build")
+    else:
+        names = [str(r) for r in refs]
+        out["external_refs"] = {"count": len(names), "names": names[:25],
+                                "via": how}
+        out["available"]["external_refs"] = True
+
+    return out
+
+
 def _colour_distance(a, b):
     if not a or not b:
         return None
@@ -227,7 +366,11 @@ def capture(baseline, doc=None, width_axis=0, progress=None,
 
     rebuild = health_gate(doc, baseline)
     raw, bodies, boxes, gmin, gmax = capture_bodies(doc)
-    amap = M.build_appearance_map(doc)
+    # The bodies just measured, not the document's own: an assembly
+    # has none of its own, and the map has to be intersected with
+    # what is actually here or it reports faces from configurations
+    # this reading never looked at.
+    amap = M.build_appearance_map(doc, bodies=raw)
     labels = discover_glyphs(raw, amap, baseline.get("labels", []),
                              colour_tol=label_colour_tol,
                              area_tol_frac=label_area_tol_frac,
@@ -246,3 +389,80 @@ def capture(baseline, doc=None, width_axis=0, progress=None,
         "interference": intf,
         "appearance_faces_mapped": len(amap),
     }
+
+# ---------------------------------------------------------------------------
+# the open / measure / close cycle, shared by every assembly task
+# ---------------------------------------------------------------------------
+
+def measure_assembly(build, empty, path=None, baseline=None, progress=None,
+                     doc_type=None):
+    """Open a document, measure it, close it. Returns the capture dict.
+
+    `doc_type` defaults to the file extension, so this serves a task that
+    grades a standalone part (task 8) as well as the assembly tasks it was
+    written for. The name stays for the harnesses that already call it.
+
+    The task supplies only the two halves that are actually its own:
+
+        build(doc, baseline, source_path, say) -> capture dict
+        empty                                  -> the capture SHAPE returned
+                                                  when nothing could be
+                                                  measured
+
+    Everything else is the same in every assembly task, and was copied
+    between tasks 15 and 17 with the differences going the wrong way: 17 had
+    grown a pywin32 guard and a progress line that 15 never got, and 15's
+    version would have raised AttributeError on a machine without pywin32
+    instead of saying what to do about it.
+
+    **A failed open returns a capture, not an exception.** A grading
+    pipeline is better served by an envelope that scores zero and states the
+    reason than by a traceback someone has to read. `empty` exists so that
+    capture still has the shape the scorer expects -- the keys are present
+    and empty rather than absent, which is the difference between "measured
+    nothing" and "this file is not a capture".
+
+    attach() arms quiet mode and the save-dialog watchdog once per process;
+    it is deliberately NOT armed again here. Two watchdogs on one dialog
+    each report a firing the other caused.
+    """
+    # Imported here, not at module scope: this module must stay importable
+    # on a machine with no pywin32 so that --score-from works off a saved
+    # capture. Same discipline as attach_app() above.
+    import sys
+    from pathlib import Path
+    from common import solidworks_session as sws
+    from common import solidworks_assembly as SA
+    if sws.win32com is None:
+        raise SystemExit("measuring needs pywin32 on Windows; score a stored "
+                         "capture with --score-from instead")
+    safe = SA.safe
+    say = progress or (lambda *_: None)
+    app = sws.attach()
+
+    if path is None:
+        doc = safe(lambda: sws.dyn(sws.active_doc(app)))
+        if doc is None:
+            return dict(empty, source_path=None,
+                        open={"active_document": True},
+                        open_error="no active document")
+        cap = build(doc, baseline, None, say)
+        cap["open"] = {"active_document": True}
+        return cap
+
+    say(f"  opening {Path(path).name}")
+    doc, diag = SA.open_readonly(app, path, doc_type=doc_type)
+    if doc is None:
+        return dict(empty, source_path=str(path), open=diag,
+                    open_error=diag.get("errors") or "null document")
+    try:
+        cap = build(doc, baseline, path, say)
+        cap["open"] = diag
+        return cap
+    finally:
+        safe(lambda: sws.close_all_documents(app))
+        # A dismissed save dialog means this run met a modal it had to click
+        # through. Silence about it would make a batch look cleaner than it
+        # was -- and the panel assembly raises one on every rebuild.
+        for line in sws.session_report():
+            print(f"  ! {line}", file=sys.stderr)

@@ -67,16 +67,38 @@ def score_band(value, lo, hi, zero_err):
 RUN_FLAG = "--_run"
 
 
-def candidate_from_argv(argv=None):
+def positional_argv(argv=None):
+    """The arguments that are not switches, argv[0] dropped.
+
+    THE SWITCHES ARE NOT ALWAYS GONE BY THE TIME THESE ARE READ.
+    `harness_cli.cli` consumes `--no-judge` and `--no-images` by
+    filtering the list it was handed, but the single-model path below
+    reads `sys.argv` itself, where they are still sitting. So
+    `harness.py --no-judge MODEL.sldasm` put the switch at index 1 and
+    the model at index 2, and the model path was parsed as a timeout:
+
+        ValueError: could not convert string to float:
+        'solution\\solution.sldasm'
+
+    -- from `float(argv[2])`, on every task in this repository, for a
+    switch every task offers. Anything beginning with `--` is dropped
+    here; a bare `-` and a negative number are left alone, being
+    neither.
+    """
     argv = sys.argv if argv is None else argv
-    if len(argv) not in (2, 3):
+    return [a for a in argv[1:] if not str(a).startswith("--")]
+
+
+def candidate_from_argv(argv=None):
+    rest = positional_argv(argv)
+    if len(rest) not in (1, 2):
         raise SystemExit("Usage: python3 harness.py candidate.py [timeout_s]")
-    return argv[1]
+    return rest[0]
 
 
 def timeout_from_argv(default, argv=None):
-    argv = sys.argv if argv is None else argv
-    return float(argv[2]) if len(argv) > 2 else default
+    rest = positional_argv(argv)
+    return float(rest[1]) if len(rest) > 1 else default
 
 
 def is_run_request(argv=None):
@@ -660,6 +682,49 @@ def read_task_id(task_dir):
         return ""
 
 
+#: Where a Harbor verifier expects its reward. `/logs/verifier` on Linux,
+#: `C:\logs\verifier` on Windows, and `LOGS_DIR` overrides both.
+def verifier_log_dir():
+    override = os.environ.get("LOGS_DIR")
+    if override:
+        return Path(override) / "verifier"
+    return Path("C:/logs/verifier") if os.name == "nt" else Path("/logs/verifier")
+
+
+def write_reward(envelope, log_dir=None):
+    r"""The one number a Harbor verifier is judged by, where it looks for it.
+
+    Harbor reads `reward.json`, falling back to `reward.txt`, and does not
+    read stdout at all. Every harness here printed its envelope to stdout
+    and wrote no reward file, so in a verifier run they would all have
+    reported nothing -- however well they graded.
+
+    The reward is the score as a FRACTION of the maximum. Raw scores here
+    run from 4.0 to 12.0 depending on the task, and a number whose meaning
+    changes per task cannot be compared across a dataset.
+
+    Written only when the log directory already exists, which is what
+    distinguishes a verifier run from someone running the harness on their
+    own machine: creating `C:\logs\verifier` on a workstation because a
+    grader happened to run there is litter, not output.
+    """
+    log_dir = Path(log_dir) if log_dir else verifier_log_dir()
+    if not log_dir.parent.is_dir():
+        return None
+    try:
+        score = float(envelope.get("score") or 0.0)
+        top = float(envelope.get("max_score") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    reward = round(score / top, 6) if top else 0.0
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "reward.txt").write_text(f"{reward}\n", encoding="utf-8")
+    except OSError:
+        return None
+    return log_dir / "reward.txt"
+
+
 def finalize(task_dir, checks, version=HARNESS_VERSION, must_pass=(),
              weights=None):
     subscores = {}
@@ -683,7 +748,12 @@ def finalize(task_dir, checks, version=HARNESS_VERSION, must_pass=(),
     envelope = {
         "task_id": read_task_id(task_dir),
         "score": score,
-        "max_score": sum(weights.get(name, 1) for name in ungated),
+        # Rounded for the same reason `score` above is: a sum of weights
+        # like 2.0 + 1.2 + 1.4 lands on 10.000000000000002 in binary, and
+        # that is what a reader of the envelope sees next to a score of
+        # 10.0. Six places is far beyond any weight anyone writes and
+        # cannot move a comparison.
+        "max_score": round(sum(weights.get(name, 1) for name in ungated), 6),
         "passed": bool(subscores) and all(v >= 1.0 for v in subscores.values()),
         "subscores": subscores,
         "harness_version": version,
@@ -696,6 +766,89 @@ def finalize(task_dir, checks, version=HARNESS_VERSION, must_pass=(),
 # --------------------------------------------------------------------------
 # Harness base class
 # --------------------------------------------------------------------------
+
+# FreeCAD stage runner (see Harness.run_freecad_stage)
+
+FREECAD_MEASURE_JSON = "measure.json"
+
+
+def load_dotenv_upwards(start, levels=8):
+    """Load the nearest .env at or above `start` (a file or directory), so
+    FREECAD_CMD and friends can live in the repo root .env."""
+    d = Path(start).resolve()
+    if d.is_file():
+        d = d.parent
+    for _ in range(levels):
+        env = d / ".env"
+        if env.is_file():
+            try:
+                import dotenv
+            except ImportError:
+                return None
+            dotenv.load_dotenv(env)
+            return env
+        d = d.parent
+    return None
+
+
+def freecad_cmd(start=None):
+    """Path to freecadcmd (FreeCAD 1.1) from FREECAD_CMD (or FREECADCMD),
+    loading the nearest .env first. Exits with a clear message when unset."""
+    load_dotenv_upwards(start or Path.cwd())
+    cmd = os.environ.get("FREECAD_CMD") or os.environ.get("FREECADCMD")
+    if not cmd:
+        raise SystemExit("FREECAD_CMD is not set; define it in a .env file "
+                         "or the environment (path to freecadcmd 1.1)")
+    return cmd
+
+
+def run_freecad_stage(stage, doc_path, out_dir=None, env=None, timeout=600,
+                      freecadcmd=None):
+    """Run a FreeCAD measurement stage script under freecadcmd.
+
+    Stage contract (see common/freecad_stage.Stage): the script reads
+    FC_STAGE_INPUT (the document to open) and FC_STAGE_OUT (a directory),
+    writes `measure.json` there (plus any extra exports it likes, e.g.
+    mesh.stl), and sets "ok": false with an "error" string in that JSON to
+    report a caught failure. FC_STAGE_COMMON points at the directory holding
+    common/ so the script can import the Stage base. Extra env vars for the
+    stage go in `env`.
+
+    Returns (measurement_dict, None) on success or (None, error_string).
+    When `out_dir` is None a temp dir is used and removed afterwards; pass
+    one to keep the stage's extra exports.
+    """
+    import shutil
+    import tempfile
+
+    stage = Path(stage)
+    keep = out_dir is not None
+    out_dir = Path(out_dir) if keep else Path(tempfile.mkdtemp(prefix="fc_stage_"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    full_env = dict(os.environ, FC_STAGE_INPUT=str(Path(doc_path).resolve()),
+                    FC_STAGE_OUT=str(out_dir.resolve()),
+                    FC_STAGE_COMMON=str(Path(__file__).resolve().parent.parent))
+    if env:
+        full_env.update({k: str(v) for k, v in env.items()})
+    cmd = [freecadcmd or freecad_cmd(stage), str(stage)]
+    try:
+        try:
+            proc = subprocess.run(cmd, env=full_env, capture_output=True,
+                                  text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None, f"stage timeout after {timeout}s"
+        meas_path = out_dir / FREECAD_MEASURE_JSON
+        if not meas_path.is_file():
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-8:]
+            return None, "stage failed: " + " | ".join(tail)
+        meas = json.loads(meas_path.read_text(encoding="utf-8"))
+        if meas.get("ok") is False:
+            return None, "stage failed:\n" + str(meas.get("error", "?"))[-800:]
+        return meas, None
+    finally:
+        if not keep:
+            shutil.rmtree(out_dir, ignore_errors=True)
+
 
 class Harness:
     """Base class for task harnesses: all the scaffolding, none of the checks.
@@ -811,6 +964,28 @@ class Harness:
         print(json.dumps(cls().main(), indent=1))
         raise SystemExit(0)
 
+    # FreeCAD tasks: out-of-process measurement under freecadcmd
+
+    # Per-task stage script (path); defaults to measure_stage.py next to
+    # the harness.
+    FREECAD_STAGE = None
+    FREECAD_STAGE_TIMEOUT_S = 600
+
+    @classmethod
+    def freecad_stage(cls):
+        if cls.FREECAD_STAGE:
+            return Path(cls.FREECAD_STAGE)
+        return Path(cls.harness_file()).parent / "measure_stage.py"
+
+    def run_freecad_stage(self, doc_path, out_dir=None, env=None,
+                          timeout=None):
+        """Measure `doc_path` with this task's stage script under freecadcmd;
+        see the module-level run_freecad_stage() for the stage contract.
+        Returns (measurement_dict, None) or (None, error_string)."""
+        return run_freecad_stage(self.freecad_stage(), doc_path,
+                                 out_dir=out_dir, env=env,
+                                 timeout=timeout or self.FREECAD_STAGE_TIMEOUT_S)
+
     # ------------------------------------------------------------------
     # SCORING-driven scored checks
 
@@ -834,3 +1009,256 @@ class Harness:
 
     def scored_checks(self, state):
         return {key: self.scored_check(state, key) for key in self.SCORING}
+
+def require_baseline_keys(payload, required, out_path):
+    """Refuse to freeze a baseline that is missing a measurement.
+
+    A re-freeze is the most dangerous routine operation a harness has. It
+    looks like maintenance, it succeeds, and if the new payload lost a
+    section that some criterion compares against, that criterion quietly
+    starts grading on less evidence instead of failing. We paid for this
+    once already: `capture_baseline()` stopped writing the modelling census,
+    the command reported success, and two thirds of the hygiene criterion
+    switched off across a whole run -- visible only as scores that drifted
+    rather than broke.
+
+    So the freeze refuses. A loud failure costs one re-run; a silent one
+    costs every grade taken until somebody notices.
+
+    Adopted from the parallel refactor's Baseline.REQUIRED_KEYS, which is
+    the same idea expressed as a class attribute.
+    """
+    missing = [k for k in required
+               if k not in payload or payload[k] in (None, {}, [])]
+    if missing:
+        raise RuntimeError(
+            f"refusing to freeze {out_path}: payload is missing {missing} -- "
+            "criteria compare against these, and a baseline without them "
+            "would silently regrade instead of failing loudly")
+    return payload
+
+# ---------------------------------------------------------------------------
+# scoring weights: one reader, not one per task
+# ---------------------------------------------------------------------------
+
+def find_task_toml(start, levels=3):
+    """The nearest task.toml at or above `start`.
+
+    Harnesses run from three different depths -- the repo checkout, the
+    Harbor-generated tests/task/harness/ copy, and a working directory of
+    someone's own choosing -- so the file is searched for rather than
+    computed from a fixed number of `..`.
+    """
+    start = Path(start)
+    for d in [start] + list(start.parents)[:levels - 1]:
+        if (d / "task.toml").is_file():
+            return d / "task.toml"
+    return start / "task.toml"
+
+
+class Baseline:
+    """The seed measurement a task grades deltas against.
+
+    Every harness in this repository freezes one and reads it back, and the
+    three copies of that code had each solved a different part of the
+    problem well and the others not at all -- the same pattern the batch
+    runner showed before it moved to harness_cli:
+
+      * task 1 warned when the file's schema was older than the harness
+        expects, but let a MISSING file surface as a bare FileNotFoundError;
+      * task 15 also warned, and returned None for a missing file, which is
+        what freezing needs but not what grading needs;
+      * task 17 raised a SystemExit naming the command that creates the file
+        -- much the friendliest failure -- but checked no schema at all.
+
+    This takes the better half of each: a missing file fails with the fix
+    printed next to it (or returns None when the caller says the baseline is
+    optional), and a schema older than the harness warns without refusing,
+    because an older baseline is still a valid measurement of the same seed;
+    it simply carries fewer probes, and the criteria that used them drop out
+    rather than fail.
+
+    `freeze` refuses to write a payload that is missing REQUIRED_KEYS -- see
+    require_baseline_keys for why that guard exists and what it cost to
+    learn.
+
+    The grader always receives a PLAIN DICT, never an instance: the scoring
+    half must stay pure Python with no dependency on this class.
+    """
+
+    def __init__(self, path, schema=None, required_keys=()):
+        self.path = Path(path)
+        self.schema = schema
+        self.required_keys = tuple(required_keys)
+
+    def load(self, path=None, optional=False):
+        """The frozen baseline as a dict, or None when optional and absent."""
+        path = Path(path) if path else self.path
+        if not path.is_file():
+            if optional:
+                return None
+            raise SystemExit(
+                f"no frozen baseline at {path}. Create it once, with "
+                f"SolidWorks running:\n  python harness.py --capture-baseline")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        got = data.get("schema")
+        if self.schema and got and got != self.schema:
+            print(f"warning: baseline schema {got!r}, expected "
+                  f"{self.schema!r} -- probes missing from it are dropped, "
+                  f"not failed", file=sys.stderr)
+        return data
+
+    def freeze(self, payload, path=None, dump=None, **extra):
+        """Write the payload as the new baseline, or refuse and say why."""
+        path = Path(path) if path else self.path
+        require_baseline_keys(payload, self.required_keys, path)
+        record = dict(payload)
+        if self.schema:
+            record["schema"] = self.schema
+        record.update(extra)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = dump(record) if dump else json.dumps(record, indent=1,
+                                                    default=str)
+        path.write_text(text, encoding="utf-8")
+        print(f"wrote {path}" + (f" (schema {self.schema})"
+                                 if self.schema else ""), file=sys.stderr)
+        return record
+
+# ---------------------------------------------------------------------------
+# report assembly: the shape every criterion-scoring task produces
+# ---------------------------------------------------------------------------
+
+def part_status(score):
+    """PASS / FAIL / PART, the three-letter spelling used in reports.
+
+    Deliberately NOT this module's PASS/FAIL/PARTIAL constants: those spell
+    the middle state "PARTIAL", and the reports tasks 15 and 17 have already
+    written -- and which we compare byte-for-byte after every refactor --
+    say "PART". The spelling is part of the output contract, not a detail to
+    tidy on the way past.
+    """
+    return "PASS" if score >= 0.999 else ("FAIL" if score <= 1e-9 else "PART")
+
+
+def resolve_weights(weights, defaults, criteria, loader=None):
+    """Weights for exactly `criteria`, filled from defaults where task.toml
+    is silent. A criterion the file never mentions still gets its designed
+    weight rather than 1.0, which would quietly reshape the rubric."""
+    if weights is None:
+        weights = loader() if loader else {}
+    return {k: weights.get(k, defaults[k]) for k in criteria}
+
+
+def assemble_report(cap, baseline, weights, criteria, analysis, scored,
+                    version, status=part_status):
+    """The report dict shared by every capture-vs-baseline task.
+
+    Lifted from two BYTE-IDENTICAL copies (tasks 15 and 17); task 1 builds
+    a differently shaped report and keeps its own. Extracted at two rather
+    than three because byte-identity is the strongest evidence of
+    commonality there is, and because task 18 is being written now -- the
+    point of the rule of three is to see the shared shape before it is
+    copied again, not to wait for the third copy to exist.
+
+    `scored` is {criterion: (score, evidence)}. Every criterion is emitted
+    even when the candidate is ungradable, so max_score holds and envelopes
+    stay comparable across models.
+    """
+    report = {
+        "harness_version": version,
+        "document": cap.get("debug_document"),
+        "capture_schema": cap.get("schema"),
+        "baseline_schema": (baseline or {}).get("schema"),
+        "rebuild": cap.get("rebuild"),
+        "weights": weights,
+        "criteria": {k: {"score": round(scored[k][0], 4),
+                         "weight": weights[k],
+                         "status": status(scored[k][0]),
+                         "evidence": scored[k][1]} for k in criteria},
+        "measurements": analysis,
+    }
+    report["overall_score"] = round(
+        sum(report["criteria"][k]["score"] * weights[k] for k in criteria), 4)
+    if analysis.get("ungradable"):
+        report["ungradable"] = analysis["ungradable"]
+    if analysis.get("notes"):
+        report["notes"] = analysis["notes"]
+    return report
+
+class Grader:
+    """One shape for every capture-vs-baseline grader in this repository.
+
+    Named for what it produces rather than what it knows: task 1 already has
+    a `Grader` full of gamepad geometry, and two classes called Grader in one
+    codebase is how a reader ends up in the wrong file.
+
+    A subclass supplies exactly two things:
+
+        analyse()  -> the measurements dict every criterion reads. Computed
+                      ONCE in __init__, so criteria share it instead of each
+                      recomputing the same body match.
+        score()    -> {criterion: (score01, evidence)} from self.m
+
+    and declares CRITERIA, DEFAULT_WEIGHTS and VERSION. Everything after
+    that -- resolving weights against task.toml, emitting every criterion
+    even for an ungradable candidate, the weighted total, the report keys --
+    is the same for all of them and lives here.
+
+    Why a class rather than the pair of free functions tasks 15 and 17 used:
+    not because those duplicated anything (they did not -- `analyse` already
+    computed shared state once), but because four harnesses are read
+    together by whoever reviews them, and a reader who has understood one
+    should not have to re-derive the shape of the next. Uniformity is a
+    property of the deliverable, not of the codebase.
+
+    The report is a PLAIN DICT. Nothing downstream depends on this class.
+
+    ONE TASK DELIBERATELY DOES NOT USE THIS, and the reason is worth having
+    written down rather than rediscovered. Task 1 (the PlayStation
+    controller) grades a PART, and its grader carries a rebuild GATE: when
+    the feature tree does not rebuild clean it zeroes the geometry criteria,
+    keeps health and hygiene, and returns an overall that is the MEAN of the
+    criteria rather than their weighted sum. assemble_report() cannot
+    produce that shape, and bending it until it could would change numbers
+    that are calibrated against a corpus.
+
+    So the family is: tasks 15, 17 and everything assembly-shaped after them
+    subclass this; task 1 keeps its own grader and says so. Uniformity that
+    has to lie about a real difference is worth less than the difference
+    being visible.
+    """
+
+    CRITERIA = ()
+    DEFAULT_WEIGHTS = {}
+    VERSION = None
+    STATUS = staticmethod(part_status)
+
+    def __init__(self, baseline, capture):
+        self.baseline = baseline or {}
+        self.capture = capture or {}
+        #: shared measurements, computed once for every criterion
+        self.m = self.analyse()
+
+    def analyse(self):
+        raise NotImplementedError
+
+    def score(self):
+        raise NotImplementedError
+
+    def ungradable(self):
+        """The reason this candidate could not be MEASURED, or None.
+
+        Distinct from measured-and-wrong: an ungradable candidate still
+        emits every criterion, so max_score holds and envelopes stay
+        comparable across a batch."""
+        return self.m.get("ungradable")
+
+    def report(self, weights=None, loader=None):
+        weights = resolve_weights(weights, self.DEFAULT_WEIGHTS,
+                                  self.CRITERIA, loader)
+        reason = self.ungradable()
+        scored = ({k: (0.0, f"UNGRADABLE: {reason}") for k in self.CRITERIA}
+                  if reason else self.score())
+        return assemble_report(self.capture, self.baseline, weights,
+                               self.CRITERIA, self.m, scored, self.VERSION,
+                               status=self.STATUS)

@@ -7,6 +7,9 @@
 
 cadquery==2.8.0
 cadquery-ocp==7.9.3.1.1
+# CadQuery 35 (worm+planetary gearbox) builds its gears with cq_gears, which
+# is not on PyPI; install from source.
+cq_gears @ git+https://github.com/meadiode/cq_gears.git
 numpy==2.2.6
 scipy==1.16.1
 trimesh==4.7.1
@@ -16,10 +19,18 @@ rtree==1.4.1
 matplotlib==3.11.1
 pillow==12.3.0
 pymupdf==1.28.2
-claude-agent-sdk==0.1.53
+# Claude route (common/call_claude.py): Claude Sonnet 5 + Fable 5.1 on
+# Azure, via AnthropicFoundry. Replaced claude-agent-sdk when the route
+# moved off Bedrock -- that SDK has no Foundry backend, and nothing here
+# runs the bundled `claude` CLI any more.
+anthropic==1.6.0
 openai==1.100.2
+# Gemini route (common/call_gemini.py): Gemini 3.1 Pro + Deep Think
+# and Gemini 3.8 Flash, via the google-genai SDK. ThinkingLevel, which
+# is how Deep Think is selected, needs >= 2.0.
+google-genai==2.23.0
 python-dotenv==1.1.0
-# point-cloud-utils==0.34.0
+point-cloud-utils==0.34.0
 python-fcl==0.7.0.11
 scikit-image==0.26.0
 manifold3d==3.5.2
@@ -30,3 +41,7 @@ manifold3d==3.5.2
 pywin32==306; sys_platform == "win32"
 pyyaml==6.0.3
 opencv-python==5.0.0.93
+pydantic>=2
+# SolidWorks 95: a .CWR is an OLE2 compound file and the harness reads
+# its solver report and element result field straight out of the streams.
+olefile==0.47

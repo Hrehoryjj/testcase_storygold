@@ -1,5 +1,6 @@
 .DS_Store
 cad-eval-set-1.0/
+cad-eval-set-2.0/
 __pycache__/
 *.pyc
 venv/
@@ -11,3 +12,13 @@ venv/
 *.step
 *.stl
 *.ply
+*.png
+*.prt
+*.SLDDRW
+# SolidWorks Simulation results: multi-GB, pinned like any other CAD binary
+*.cwr
+*.CWR
+
+# Per-task scratch runs from tools/try_model.py (model answer,
+# candidate file, harness report). Regenerated on demand.
+_runs/

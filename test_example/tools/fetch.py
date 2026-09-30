@@ -7,7 +7,6 @@ its checksum. Run once after cloning (or after tools/sync.py changes the remote)
     python3 tools/fetch.py            # fetch everything missing
     python3 tools/fetch.py FreeCAD    # restrict to a subtree
     python3 tools/fetch.py --check    # report what is missing, download nothing
-    python3 tools/fetch.py --skip-stl # skip .STL meshes (large, rarely needed)
 
 Flags may be combined with a subtree, in any order. A subtree is matched
 against the POSIX form of the task path, so both slash styles work on
@@ -65,7 +64,6 @@ MISSING: list[str] = []
 LOCKED: list[str] = []
 RENORMALISED: list[str] = []
 CORRUPT: list[str] = []
-SKIPPED: list[str] = []
 STALE: list[str] = []
 PENDING: list[tuple[str, int, str]] = []  # (folder label, bytes, status)
 
@@ -204,9 +202,6 @@ def _fetch_folder(task_dir: Path, asset: dict, opts: "Opts") -> int:
         state = _status(dest, sha)
         if state == "ok":
             continue
-        if opts.skip_stl and rel.lower().endswith(".stl"):
-            SKIPPED.append(str(dest.relative_to(ROOT)))
-            continue
         if opts.check:
             PENDING.append((label, int(size), state))
             continue
@@ -221,10 +216,9 @@ def _fetch_folder(task_dir: Path, asset: dict, opts: "Opts") -> int:
 class Opts:
     """Command-line switches, so the walk does not read sys.argv itself."""
 
-    def __init__(self, subtree=None, check=False, skip_stl=False):
+    def __init__(self, subtree=None, check=False):
         self.subtree = subtree
         self.check = check
-        self.skip_stl = skip_stl
 
 
 def _matches(task_dir: Path, subtree: str | None) -> bool:
@@ -244,9 +238,8 @@ def _matches(task_dir: Path, subtree: str | None) -> bool:
     return want in task_dir.relative_to(ROOT).as_posix()
 
 
-def fetch_all(subtree: str | None = None, check: bool = False,
-              skip_stl: bool = False) -> int:
-    opts = Opts(subtree, check, skip_stl)
+def fetch_all(subtree: str | None = None, check: bool = False) -> int:
+    opts = Opts(subtree, check)
     fetched = 0
     seen_tasks = 0
     for toml_path in sorted(ROOT.glob("*/*/task.toml")):
@@ -262,9 +255,6 @@ def fetch_all(subtree: str | None = None, check: bool = False,
             dest = task_dir / asset["path"]
             state = _status(dest, asset["sha256"])
             if state == "ok":
-                continue
-            if opts.skip_stl and str(dest).lower().endswith(".stl"):
-                SKIPPED.append(str(dest.relative_to(ROOT)))
                 continue
             if opts.check:
                 PENDING.append((str(dest.relative_to(ROOT)),
@@ -323,8 +313,6 @@ def _report() -> None:
               "manifest, and were overwritten with the pinned blob:")
         for m in STALE[:10]:
             print(f"  {m}")
-    if SKIPPED:
-        print(f"{len(SKIPPED)} .STL file(s) skipped by --skip-stl")
     if RENORMALISED:
         print(f"{len(RENORMALISED)} file(s) only resolved under the other "
               "Unicode normalisation of their name -- the manifest and the "
@@ -356,16 +344,15 @@ if __name__ == "__main__":
     except Exception:
         pass
     argv = sys.argv[1:]
-    known = {"--check", "--skip-stl"}
+    known = {"--check"}
     # A mistyped flag must not be read as a subtree, and must not be ignored
     # either: both failure modes end in a run that prints something reassuring
     # and does nothing. Same reason the subtree filter now speaks up (_matches).
     unknown = [a for a in argv if a.startswith("-") and a not in known]
     if unknown:
         raise SystemExit(f"unknown option(s): {' '.join(unknown)}\n"
-                         f"usage: fetch.py [--check] [--skip-stl] [SUBTREE]")
+                         f"usage: fetch.py [--check] [SUBTREE]")
     rest = [a for a in argv if not a.startswith("-")]
     if len(rest) > 1:
         raise SystemExit(f"expected at most one subtree, got: {' '.join(rest)}")
-    fetch_all(rest[0] if rest else None,
-              check="--check" in argv, skip_stl="--skip-stl" in argv)
+    fetch_all(rest[0] if rest else None, check="--check" in argv)
