@@ -2,7 +2,7 @@
 
     python3 tools/selftest_synthetic.py
 
-Scores the shipped captures (results/captures/*.json.gz, one per model, taken
+Scores the shipped captures (evidence/captures/*.json.gz, one per model, taken
 with SolidWorks by `harness.py --batch --capture-only`) and synthetic variants
 built from them, then asserts the grading contract:
 
@@ -30,7 +30,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 TASK = ROOT / "SolidWorks" / "1_playstation_controller"
-CAPS = TASK / "results" / "captures"
+CAPS = TASK / "evidence" / "captures"
 
 spec = importlib.util.spec_from_file_location(
     "harness", TASK / "tests" / "task" / "harness" / "harness.py")

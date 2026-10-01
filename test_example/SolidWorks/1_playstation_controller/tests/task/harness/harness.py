@@ -2619,6 +2619,10 @@ class Grader:
         # authored models, not one author's variations, and their trees
         # have no common scale.
         #
+        # (2.4.0: these counts still carry no threshold. The edit in
+        # `adversarial_unrequested_change_elsewhere` is now caught by
+        # geometry instead, by the skin-split check in 5.4 below.)
+        #
         # So the numbers are printed where the score is, and the score is
         # left alone. A 7.000 that also says "three features and nine
         # faces the seed does not have" is not the same artefact as a
@@ -2692,10 +2696,12 @@ class Grader:
                           "exempt from the reshape check -- the reference "
                           "remodels them.  Sticks/triggers/bumpers must keep "
                           "their shape.  Scored by weight, not as a gate.  "
-                          "AN UNREQUESTED EDIT INSIDE AN EXEMPT BODY IS NOT "
-                          "CAUGHT HERE: see detail.tree_and_faces for the "
-                          "trace it leaves, and DATASET_ISSUES for why it "
-                          "is reported rather than charged."}
+                          "Inside the housing, skin_splits catches a shallow "
+                          "insert (0.1 to 0.3 mm) on skin the task did not "
+                          "ask to change; a taller one, or one on the "
+                          "reshaped grips or near a control, is not caught: "
+                          "see detail.tree_and_faces for the trace it "
+                          "leaves."}
 
     # -- assemble --------------------------------------------------------
     def grade(self):

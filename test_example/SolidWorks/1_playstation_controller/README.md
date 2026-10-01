@@ -32,8 +32,8 @@ it is 16–29 s per part, and if COM did not attach you want to know now.
 python tests\task\harness\harness.py reference.SLDPRT
 ```
 
-This must come back `7.0/7.0`, `passed: true`. **If the reference is not
-7.000, stop** — the baseline or a threshold is wrong, not the reference. It is
+This must come back `8.0/8.0`, `passed: true`. **If the reference is not
+8.000, stop** — the baseline or a threshold is wrong, not the reference. It is
 the one check worth doing every time.
 
 **2. Measure the corpus.** Measuring, not scoring: this is the expensive half
@@ -110,8 +110,8 @@ batch mode never touches its shape:
 ```json
 {
  "task_id": "solidworks-0001-playstation-controller",
- "score": 7.0,
- "max_score": 7.0,
+ "score": 8.0,
+ "max_score": 8.0,
  "passed": true,
  "subscores": {
   "rebuild health": 1.0,
@@ -120,32 +120,50 @@ batch mode never touches its shape:
   "clusters at mirrored positions": 1.0,
   "no new control interference": 1.0,
   "left-handed layout achieved": 1.0,
-  "no unrequested changes": 1.0
+  "no unrequested changes": 1.0,
+  "markings preserved": 1.0
  },
- "harness_version": "2.1.5"
+ "harness_version": "2.4.0"
 }
 ```
 
 #### What the weights mean
 
-`max_score` is 7.0, and the seven components are not equal, because the
+`max_score` is 8.0, and the eight components are not equal, because the
 instruction is not a list of equals. Weights live in `ALL_CRITERIA` in the
 harness, each with its reasoning next to it; `task.toml` carries their sum.
 
 | | Weight | |
 |---|---:|---|
-| widened by 15 mm | 1.5 | what the task **asks for** — 5.0 of 7.0 |
+| widened by 15 mm | 1.5 | what the task **asks for**: 5.0 of 8.0 |
 | clusters at mirrored positions | 1.5 | |
 | left-handed layout achieved | 2.0 | heaviest: the demand the last sentence is about |
-| no new control interference | 0.5 | what merely **constrains** the edit — 1.0 of 7.0 |
+| no new control interference | 0.5 | what merely **constrains** the edit: 1.0 of 8.0 |
 | no unrequested changes | 0.5 | |
-| rebuild health | 0.5 | preserving design intent and the feature tree — 1.0 of 7.0 |
+| rebuild health | 0.5 | preserving design intent and the feature tree: 1.0 of 8.0 |
 | modelling hygiene | 0.5 | |
+| markings preserved | 1.0 | the face-button symbols must **remain** (instruction.md, last sentence) |
 
-The split matters because the bottom four are **negative** criteria: a
-candidate who never opened the file passes all of them. Their combined weight
-is therefore the floor a do-nothing submission collects — 28.6% here, against
-the 50% it collected when all five geometry components were equal.
+The split matters because five of them (interference, unrequested changes,
+rebuild health, hygiene, markings) are **negative** criteria: a candidate who
+never opened the file passes all of them. Their combined weight is therefore
+the floor a do-nothing submission collects: 3.0 of 8.0 (37.5%), which the
+untouched seed scores exactly.
+
+#### A tree that rebuilds with errors is discounted, not zeroed
+
+Every geometry criterion is multiplied by the `rebuild health` score, and the
+unscaled value is kept as `measured_score`. Before 2.4.0 any newly broken
+feature zeroed all geometry, so one broken feature and a tree in ruins scored
+the same, and what the candidate actually got wrong was never measured.
+Health reaches 0 at 13.3% of the tree newly broken (1.5 times stricter than
+the 20% it used when it priced only its own 0.5 point), because it now also
+scales 7.0 points of geometry. The factor was chosen so that a part that does
+not rebuild does not outrank a clean part with a geometry mistake: on this
+corpus that ordering holds from a factor of 1.37 up, and 1.5 is the nearest
+round value above it. That threshold comes from this corpus, not from the
+task, and is stated as such. A rebuild that could not run at all still zeroes
+the geometry.
 
 #### `passed` means flawless, not "good enough"
 
@@ -203,6 +221,10 @@ from, measured the way this harness measures.
 python tests\task\harness\harness.py --capture-baseline ..\SolidWorks\1_playstation_controller\environment\input.SLDPRT
 ```
 
+The shipped baseline is the upstream one plus two blocks taken from a fresh
+schema /6 capture of the same seed: `housing_halves` (for the width
+criterion) and `housing_faces` (for the skin-split check), one face per line.
+
 Re-measures the seed and rewrites the whole baseline. Run it when the seed
 part changes, when the harness starts recording something it did not record
 before, or when porting the rubric to another part. Everything downstream
@@ -238,14 +260,20 @@ every criterion at once.
 python3 tools/selftest_synthetic.py
 ```
 
-Runs anywhere, including Linux and CI. `Grader` consumes two plain
-dictionaries and touches no COM object, so its arithmetic is testable in
-isolation. The script synthesises candidates by transforming the real baseline
-measurements to match each adversarial description, then asserts 13 properties
-(the reference scores full marks; a broken feature tree zeroes the geometry
-criteria while still emitting all seven subscores; every adversarial is
-distinct; doing nothing loses to every real attempt; destroying the evidence
-does not pay; and so on).
+Run from `test_example/`. Runs anywhere, including Linux and CI. `Grader`
+consumes two plain dictionaries and touches no COM object, so its arithmetic is
+testable in isolation. The script scores the shipped SolidWorks captures in
+`evidence/captures/` (one per model, gzipped) and synthetic variants built from
+the reference capture, and asserts:
+
+- the reference scores 8.0 and the untouched seed the 3.0 floor;
+- every example loses points, and only on the criteria it gets wrong (the two
+  models with rebuild errors may lose anywhere, since health scales them);
+- the reference cut at the mirror plane into left and right pieces, another
+  valid way to widen, still scores 8.0;
+- on faces the skin-split check covers, a 0.15 to 0.25 mm step (raised or
+  sunk) costs `no unrequested changes` and nothing else, and a zero-height
+  split line on the same face costs nothing.
 
 This validates the **scoring logic**, not the measurement layer — `capture()`,
 `assign_roles()` and the port-light face matching all read live geometry.
@@ -271,12 +299,28 @@ This validates the **scoring logic**, not the measurement layer — `capture()`,
   weighted by area. `adversarial_text_mirrored_incorrectly` is caught by
   the port-light witness — that the indicator glyphs moved across the
   plane — not by anything about the text itself.
-- **A shell widened without its controls moving.** The width criterion
-  measures the growth of mirror-pair separation, which is deliberately
-  robust to a housing remodel and for that reason blind to an edit that
-  widens the shell and leaves the bodies where they were. The X span is
-  captured and marked `diagnostic only -- not scored`. This is a limit of
-  the metric, not of the files.
+- **The exact width of the shell itself.** Since 2.4.0 `widened by 15 mm`
+  is half mirror-pair growth against +15 mm and half the growth of the
+  housing halves (area-weighted face X either side of the plane): full
+  credit from +15 mm to +30 mm, rising from 0 below, falling to 0 at +45 mm.
+  The shell is not sized against exactly 15 mm because the shipped reference
+  grows its housing halves +20.6 mm (bbox +21.9) while its controls move
+  +15.0. For the same reason "controls follow the grips" is reported in the
+  cluster criterion but not scored. The halves witness is a proxy: hollowing
+  the shell or adding large faces also moves it.
+- **Unrequested edits the skin-split check cannot see.** `no unrequested
+  changes` now also looks for a new face cut into an old one on the part of
+  the housing the task did not ask to change (the seed skin moved by the
+  task rule, minus the widening strip and an 8 mm margin around every
+  control). It catches shallow inserts, 0.1 to 0.3 mm proud or sunk, which
+  is what `adversarial_unrequested_change_elsewhere` is (a 0.15 mm band).
+  It does not see an addition taller than 0.3 mm, an edit on the grips the
+  reference legitimately reshapes, an edit inside a control margin, or a
+  fillet. Widening its tolerance to 1.0 mm made the reference itself lose
+  0.25 points, so it was left at 0.3 mm. Its samples come from SolidWorks
+  tessellation, so a much coarser image-quality setting can hide an insert
+  (it cannot invent one). An earlier zone check on feature footprints was
+  rejected because it flagged 16 features of the reference.
 - **How much confidence the sidedness verdict deserves.** On genuinely
   edited models the guard rests on ONE readable witness: the port-light
   glyphs, because `housing_side_signature` returns `UNVERIFIABLE` whenever
