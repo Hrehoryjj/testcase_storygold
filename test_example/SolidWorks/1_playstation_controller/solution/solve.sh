@@ -1,6 +1,6 @@
 #!/bin/bash
 # TODO: not automatable here. The reference answer is solution.SLDPRT (the
-# engineer's widen + left-hand conversion, scores 5/5), but there is no
+# engineer's widen + left-hand conversion, scores 8.0/8.0), but there is no
 # headless way to "apply" a SolidWorks part inside a container -- SolidWorks
 # has to actually open and rebuild the file through its own GUI/COM session.
 #

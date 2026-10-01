@@ -149,13 +149,20 @@ BASELINE_PATH = TASK_DIR / "prompt" / "input.json"
 
 PASS, PARTIAL, FAIL, UNVERIFIABLE = "PASS", "PARTIAL", "FAIL", "UNVERIFIABLE"
 
-HARNESS_VERSION = "2.3.1"
+HARNESS_VERSION = "2.4.0"
 # Bumped whenever capture() changes what it records or what a field means.
 # /3 changed plane_x_m from "the baseline's plane" to "the plane this part
 # actually has". A /2 capture still scores correctly -- its plane equals the
 # baseline's, so the normalisation is a no-op -- but it cannot exercise the
 # translation handling, hence the warning rather than a refusal.
-CAPTURE_SCHEMA = "ps3-capture/4"
+CAPTURE_SCHEMA = "ps3-capture/6"
+# /5 adds `housing_halves`: where each half of the shell sits, which c1
+# uses as half of its widening evidence.
+# /6 adds `housing_faces`: one record per housing face (area, centroid,
+# outward normal, box, surface type, cylinder axis) with one surface sample
+# per 3 mm cell, for the c5 skin-split check.
+# Older captures still score: c1 falls back to the mirror pairs, c5 skips
+# the skin-split check, and each says so.
 
 #: HOW FAR THE MEASURED MIRROR MAY SIT from where the seed's mirror
 #: travelled to, before it is called a mis-detection rather than an
@@ -232,7 +239,12 @@ TOL = {
     # -- C0: rebuild health, graded on the fraction of features newly
     # broken so it transfers to trees of a different size -------------------
     "health_perfect_frac": 0.0,
-    "health_zero_frac": 0.20,
+    # 1.5x stricter than the 0.20 it was. The health score is now also the
+    # trust multiplier on every geometry criterion (see grade()), so it has
+    # to fall faster than when it only priced itself at 0.5 of 8.0: 5% of
+    # the tree newly broken now keeps 0.61 of the geometry credit, 13.3%
+    # keeps none.
+    "health_zero_frac": 0.20 / 1.5,
     # -- C0: modelling hygiene, all deltas against the seed -----------------
     "warn_perfect": 0.0,
     "warn_zero": 5.0,
@@ -249,6 +261,13 @@ TOL = {
     "width_perfect_mm": 0.5,     # full marks inside +/-0.5 mm
     "width_zero_under_mm": 15.0,   # undershoot: 0.0 when delta == 0
     "width_zero_over_mm": 22.5,    # overshoot:  0.0 when delta == 37.5
+    # -- C1: housing halves (the shell itself, not the controls on it) -------
+    "halves_deadband_mm": 2.0,   # faces nearer the plane belong to no half
+    # The shell half of c1 is not sized against +15 mm: the reference grows
+    # its halves +20.6 mm because it remodels the grips. Full credit from
+    # +15 mm up to twice the requested width, none at three times it.
+    "shell_full_to_mm": 30.0,
+    "shell_zero_at_mm": 45.0,
     # -- C2: cluster geometry ----------------------------------------------
     "intra_perfect_mm": 0.5,     # rigid-diamond internal spacing
     "intra_zero_mm": 5.0,
@@ -290,6 +309,16 @@ TOL = {
     # would leave several percent of trigger deformation unscored.
     "fp_perfect": 0.01,
     "fp_zero": 0.08,
+    # -- C5: skin splits (a new face cut into an old one) --------------------
+    "skin_on_mm": 0.3,           # a sample this close to the moved seed skin
+    "skin_normal_dot": 0.9,      #   and facing the same way lies on it
+    "skin_face_frac": 0.7,       # share of a face that must lie on the skin
+    "skin_margin_mm": 8.0,       # around the plane strip and every control
+    "skin_piece_min_mm2": 5.0,   # a sliver below this is not a piece
+    "skin_step_mm": 0.1,         # a piece must sit this far off its sibling
+    "skin_perfect_mm2": 20.0,    # extra area below this is tessellation
+    "skin_half_mm2": 60.0,       # 0.5 here: any real insert costs half
+    "skin_zero_mm2": 2000.0,
     # -- body matching ------------------------------------------------------
     "match_fp_weight": 1.0,      # cost per unit of fingerprint distance
     "match_pos_weight_per_mm": 0.02,   # cost per mm of positional residual
@@ -811,6 +840,138 @@ def housing_detail_side(faces, plane_x):
     }
 
 
+def housing_halves(faces, plane_x):
+    """Where each half of the shell sits, as an offset from the plane.
+
+    instruction.md asks to widen the BODY by separating its two hand-grip
+    halves. c1 used to read that only through the controls (sticks,
+    triggers, bumpers), so a shell widened exactly 15 mm with its controls
+    left behind scored 0 on "widened by 15 mm". This is the shell's own
+    witness: the area-weighted mean X of the housing faces on each side of
+    the plane. Offsets, not absolute X, so a part whose origin moved is
+    read the same as one that did not.
+    """
+    band = TOL["halves_deadband_mm"] / MM
+    sums = {"left": [0.0, 0.0], "right": [0.0, 0.0]}
+    for a, c in faces:
+        d = c[0] - plane_x
+        if abs(d) < band:
+            continue
+        side = "right" if d > 0 else "left"
+        sums[side][0] += a * d
+        sums[side][1] += a
+    if not sums["left"][1] or not sums["right"][1]:
+        return None
+    left = sums["left"][0] / sums["left"][1]
+    right = sums["right"][0] / sums["right"][1]
+    return {"left_dx_m": left, "right_dx_m": right,
+            "separation_m": right - left,
+            "area_left_m2": sums["left"][1], "area_right_m2": sums["right"][1],
+            "deadband_mm": TOL["halves_deadband_mm"]}
+
+
+SAMPLE_CELL_M = 0.003   # surface samples: triangles merged per 3 mm cell
+
+
+def _face_tess_stats(face):
+    """Area-weighted centroid, mean outward normal and one surface sample
+    per SAMPLE_CELL_M cube the face passes through [x, y, z, area, nx, ny, nz] (metres, m2) from the face's own
+    tessellation, or (None, None, []) when SolidWorks has none for it."""
+    try:
+        tri = list(face.GetTessTriangles(True) or [])
+    except Exception:
+        tri = []
+    try:
+        nrm = list(z(face.GetTessNorms) or [])
+    except Exception:
+        nrm = []
+    nt = len(tri) // 9
+    if nt < 1:
+        return None, None, []
+    c, n, a_tot = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.0
+    buckets = {}
+    for t in range(nt):
+        p = [tri[9 * t + 3 * k: 9 * t + 3 * k + 3] for k in range(3)]
+        u = [p[1][i] - p[0][i] for i in range(3)]
+        v = [p[2][i] - p[0][i] for i in range(3)]
+        cr = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2],
+              u[0] * v[1] - u[1] * v[0]]
+        a = 0.5 * math.sqrt(sum(x * x for x in cr))
+        if a <= 0.0:
+            continue
+        a_tot += a
+        g = [(p[0][i] + p[1][i] + p[2][i]) / 3.0 for i in range(3)]
+        key = tuple(int(math.floor(x / SAMPLE_CELL_M)) for x in g)
+        bk = buckets.setdefault(key, [0.0] * 7)
+        for i in range(3):
+            c[i] += a * g[i]
+            bk[i] += a * g[i]
+        bk[3] += a
+        if len(nrm) >= 9 * (t + 1):
+            tn = [sum(nrm[9 * t + 3 * k + i] for k in range(3)) / 3.0
+                  for i in range(3)]
+        else:
+            tn = [x / (2.0 * a) for x in cr]
+        for i in range(3):
+            n[i] += a * tn[i]
+            bk[4 + i] += a * tn[i]
+    if a_tot <= 0.0:
+        return None, None, []
+    c = [x / a_tot for x in c]
+    ln = math.sqrt(sum(x * x for x in n))
+    samples = []
+    for bk in buckets.values():
+        if bk[3] <= 0.0:
+            continue
+        bl = math.sqrt(sum(x * x for x in bk[4:7])) or 1.0
+        samples.append([bk[0] / bk[3], bk[1] / bk[3], bk[2] / bk[3], bk[3]]
+                       + [x / bl for x in bk[4:7]])
+    return c, ([x / ln for x in n] if ln > 0 else None), samples
+
+
+def housing_face_list(raw_bodies, housing_ids):
+    """Every housing face, one record each, for the c5 face-correspondence
+    check and the c3 coaxiality check. Millimetres, rounded, so the capture
+    stays small: a (area mm2), c (centroid), n (outward normal), b (box),
+    s (surface: plane / cyl / other), cyl (origin, axis, radius), p (one
+    surface sample per 3 mm cell: x, y, z mm, the area mm2 it stands for,
+    and the local outward normal)."""
+    out = []
+    for hid in housing_ids:
+        body = raw_bodies[int(hid[1:])]
+        for f in (z(body.GetFaces) or []):
+            try:
+                a = float(z(f.GetArea))
+                box = [float(v) for v in z(f.GetBox)]
+            except Exception:
+                continue
+            c, n, smp = _face_tess_stats(f)
+            if c is None:
+                c = [(box[k] + box[k + 3]) / 2 for k in range(3)]
+            rec = {"body": hid, "a": round(a * 1e6, 4),
+                   "c": [round(v * MM, 3) for v in c],
+                   "n": [round(v, 4) for v in n] if n else None,
+                   "b": [round(v * MM, 3) for v in box], "s": "other",
+                   "p": [[round(q[0] * MM, 2), round(q[1] * MM, 2),
+                          round(q[2] * MM, 2), round(q[3] * 1e6, 3),
+                          round(q[4], 3), round(q[5], 3), round(q[6], 3)]
+                         for q in smp]}
+            try:
+                surf = z(f.GetSurface)
+                if z(surf.IsPlane):
+                    rec["s"] = "plane"
+                elif z(surf.IsCylinder):
+                    rec["s"] = "cyl"
+                    cp = [float(v) for v in z(surf.CylinderParams)]
+                    rec["cyl"] = ([round(v * MM, 3) for v in cp[0:3]]
+                                  + [round(v, 5) for v in cp[3:6]]
+                                  + [round(cp[6] * MM, 4)])
+            except Exception:
+                pass
+            out.append(rec)
+    return out
+
+
 def find_light_cluster_seed(faces, plane_x, bbox):
     """Seed-side identification: tiny faces on the top-rear edge, well off
     the mirror plane."""
@@ -1009,6 +1170,7 @@ def capture(doc, baseline=None, plane_x=None):
     if P is not None:
         sig = housing_signature(hfaces, P)
         detail = housing_detail_side(hfaces, P)
+        halves = housing_halves(hfaces, P)
         seed_cluster = (baseline or {}).get("light_cluster")
         if seed_cluster:
             lights = find_light_cluster_candidate(hfaces, P, seed_cluster)
@@ -1017,6 +1179,7 @@ def capture(doc, baseline=None, plane_x=None):
     else:
         sig = {"moment3_m5": 0.0, "sign": 0, "faces": 0}
         detail = None
+        halves = None
         lights = None
 
     intf = control_interference(raw, bodies, roles)
@@ -1037,8 +1200,10 @@ def capture(doc, baseline=None, plane_x=None):
         "small_face_counts": smf,
         "housing_signature": sig,
         "housing_detail": detail,
+        "housing_halves": halves,
         "light_cluster": lights,
         "interference": intf,
+        "housing_faces": housing_face_list(raw, roles.get("housing", [])),
     }
 
 
@@ -1549,11 +1714,28 @@ class Grader:
         unwidened shell with correctly swapped clusters then loses c1 only,
         instead of being charged twice for a single mistake.
         """
+        # The mirror pairs, not the shell: on the shipped reference the
+        # housing halves grow +20.6 mm while the controls move +15.0, so
+        # the shell is not a ruler for where the controls belong.
+        mean_delta_mm = self._pair_mean_delta_mm()
+        if mean_delta_mm is None:
+            return POLICY["half_mm"] / MM
+        return (mean_delta_mm / 2.0) / MM
+
+    def _pair_mean_delta_mm(self):
         rows = self._pair_rows()
         if not rows:
-            return POLICY["half_mm"] / MM
-        mean_delta_mm = sum(r["delta_mm"] for r in rows) / len(rows)
-        return (mean_delta_mm / 2.0) / MM
+            return None
+        return sum(r["delta_mm"] for r in rows) / len(rows)
+
+    def _shell_delta_mm(self):
+        """Growth of the housing-half separation, in mm, or None when either
+        capture predates the measurement (schema < /5)."""
+        b = self.bl.get("housing_halves")
+        c = self.ms.get("housing_halves")
+        if not b or not c:
+            return None
+        return (c["separation_m"] - b["separation_m"]) * MM
 
     # -- c0: rebuild health ---------------------------------------------
     def c0_health(self):
@@ -1685,26 +1867,61 @@ class Grader:
         return out
 
     # -- c1 ------------------------------------------------------------
+    def _width_score(self, delta_mm):
+        return asymmetric_target_score(
+            delta_mm, POLICY["width_delta_mm"], TOL["width_perfect_mm"],
+            TOL["width_zero_under_mm"], TOL["width_zero_over_mm"])
+
+    def _shell_score(self, shell_mm):
+        target = POLICY["width_delta_mm"]
+        if shell_mm <= target:
+            return clamp01(shell_mm / target)
+        return score_error(shell_mm - target,
+                           TOL["shell_full_to_mm"] - target,
+                           TOL["shell_zero_at_mm"] - target)
+
     def c1_width(self):
+        """Was the BODY widened by 15 mm?
+
+        Half the score is the mirror-pair growth against +15 mm, half is
+        whether the shell's own halves (housing_halves) grew: full credit
+        from +15 mm to twice that, nothing at three times it. A shell widened
+        with its controls left behind used to score 0 here; it now keeps the
+        half it earned. Captures older than /5 fall back to the pairs.
+        """
         target = POLICY["width_delta_mm"]
         rows = self._pair_rows()
         for r in rows:
-            r["score"] = round(asymmetric_target_score(
-                r["delta_mm"], target,
-                TOL["width_perfect_mm"],
-                TOL["width_zero_under_mm"],
-                TOL["width_zero_over_mm"]), 4)
+            r["score"] = round(self._width_score(r["delta_mm"]), 4)
         # Mean of per-pair SCORES, not a score of the mean delta: averaging
         # deltas would let +30 mm on one pair cancel 0 mm on another and
         # hand full marks to a visibly deformed part.
-        score = mean_scores([r["score"] for r in rows], default=0.0)
+        pair_score = mean_scores([r["score"] for r in rows], default=0.0)
+        shell = self._shell_delta_mm()
+        if shell is None:
+            return {"score": round(pair_score, 4),
+                    "status": status_of(pair_score),
+                    "target_delta_mm": target, "witness": "mirror pairs",
+                    "pairs": rows,
+                    "note": "capture predates housing_halves (schema /5): "
+                            "graded on the mirror pairs as in 2.3.x",
+                    "evidence": "growth of mirror-pair separation "
+                                "(sticks/triggers/bumpers)."}
+        shell_score = self._shell_score(shell)
+        score = 0.5 * pair_score + 0.5 * shell_score
         return {"score": round(score, 4), "status": status_of(score),
-                "target_delta_mm": target, "pairs": rows,
-                "evidence": "growth of mirror-pair separation "
-                            "(sticks/triggers/bumpers); robust to a housing "
-                            "remodel, global bbox not used. Asymmetric: "
-                            "undershoot reaches 0 at delta=0, overshoot "
-                            "decays more slowly."}
+                "target_delta_mm": target, "witness": "pairs + shell",
+                "pair_score": round(pair_score, 4),
+                "shell_delta_mm": round(shell, 3),
+                "shell_score": round(shell_score, 4),
+                "pairs": rows,
+                "evidence": "half: mirror-pair separation growth against "
+                            "+15 mm (asymmetric: undershoot reaches 0 at "
+                            "delta=0, overshoot decays more slowly); half: "
+                            "growth of the housing halves' separation "
+                            "(area-weighted face X either side of the "
+                            "plane): full credit from +15 mm to +30 mm, "
+                            "rising from 0 below, falling to 0 at +45 mm."}
 
     # -- c2 ------------------------------------------------------------
     def c2_spacing(self):
@@ -1787,6 +2004,18 @@ class Grader:
         det["role_weights"] = ROLE_WEIGHT
 
         rigid_mult = RIGID_FLOOR + (1.0 - RIGID_FLOOR) * clamp01(intra)
+
+        # 2.3 -- controls vs grips: REPORTED, not scored. The shipped
+        # reference grows its housing halves +20.6 mm while its controls
+        # move +15.0, so "pairs == shell" would fail the reference itself.
+        shell = self._shell_delta_mm()
+        pairs = self._pair_mean_delta_mm()
+        if shell is not None and pairs is not None:
+            det["controls_follow_grips"] = {
+                "shell_delta_mm": round(shell, 3),
+                "pairs_delta_mm": round(pairs, 3),
+                "note": "reported only; not part of the score"}
+
         score = clamp01(position) * rigid_mult
         return {"score": round(score, 4), "status": status_of(score),
                 "model": "cluster_placement x rigidity",
@@ -2181,6 +2410,149 @@ class Grader:
                           "this criterion's."}
 
     # -- c5 ------------------------------------------------------------
+    def _skin_zones(self, P, half):
+        """Boxes around every control, at its seed position moved by the
+        task rule and at its candidate position, widened by skin_margin_mm."""
+        m = TOL["skin_margin_mm"]
+        zones = []
+        for src, moved in ((self.ms, False), (self.bl, True)):
+            for role, b in (src.get("role_bbox_m") or {}).items():
+                if role == "housing" or not b:
+                    continue
+                bb = [v * MM for v in b]
+                if moved:
+                    cx = (bb[0] + bb[3]) / 2
+                    if abs(cx - P) < TOL["halves_deadband_mm"]:
+                        bb[0] -= half
+                        bb[3] += half
+                    else:
+                        sg = 1 if cx > P else -1
+                        bb[0] += sg * half
+                        bb[3] += sg * half
+                zones.append([bb[i] - m for i in range(3)]
+                             + [bb[i + 3] + m for i in range(3)])
+        return zones
+
+    @staticmethod
+    def _skin_exempt(p, P, half, zones):
+        """True where an edit was asked for: the widening strip about the
+        plane, or near a control."""
+        if abs(p[0] - P) <= half + TOL["skin_margin_mm"]:
+            return True
+        return any(all(z[i] <= p[i] <= z[i + 3] for i in range(3))
+                   for z in zones)
+
+    # -- c5.3: skin splits ----------------------------------------------
+    def _skin_splits(self):
+        """Area of new faces cut INTO a seed face the edit had no reason to
+        touch, in mm2, with the evidence -- or None when either capture
+        predates `housing_faces` (schema /6).
+
+        Sizes change everywhere on a widened shell, so this does not compare
+        sizes. It moves every seed housing sample by the task's own rule
+        (left half -half, right half +half, faces on the plane both ways),
+        keeps the candidate faces that still lie ON that moved skin, and
+        asks which seed face each one covers. One seed face covered by two
+        candidate faces on the same side was cut into: something was
+        embossed, engraved or imprinted there. The smaller pieces are the
+        extra area.
+
+        Out of scope by construction, so a different valid solution is not
+        charged: the widening strip around the plane, a margin around every
+        control (seed and candidate positions), everything that left the
+        moved skin (a remodelled grip, a hollowed interior), a seed face
+        cut at the plane into a left and a right piece, and a piece that
+        sits on the same surface as its sibling (a split line changes no
+        geometry). Nothing here reads names or the feature tree.
+        """
+        sf = self.bl.get("housing_faces")
+        cf = self.ms.get("housing_faces")
+        if not sf or not cf:
+            return None
+        P = self.P * MM
+        half = self._actual_half_m() * MM
+        dx = self.plane_shift_m * MM
+        cell = 4.0
+        grid = {}
+        for fi, f in enumerate(sf):
+            for q in f.get("p") or []:
+                if len(q) < 7:
+                    continue
+                d = q[0] - P
+                sides = (1, -1) if abs(d) < TOL["halves_deadband_mm"] \
+                    else ((1,) if d > 0 else (-1,))
+                for sg in sides:
+                    s_ = (q[0] + sg * half, q[1], q[2], q[4], q[5], q[6], fi)
+                    key = tuple(int(math.floor(s_[i] / cell))
+                                for i in range(3))
+                    grid.setdefault(key, []).append(s_)
+
+        def nearest(p):
+            k = tuple(int(math.floor(p[i] / cell)) for i in range(3))
+            best = None
+            for ox in (-1, 0, 1):
+                for oy in (-1, 0, 1):
+                    for oz in (-1, 0, 1):
+                        for s_ in grid.get((k[0] + ox, k[1] + oy, k[2] + oz),
+                                           ()):
+                            d2 = sum((p[i] - s_[i]) ** 2 for i in range(3))
+                            if best is None or d2 < best[0]:
+                                best = (d2, s_)
+            return best[1] if best else None
+
+        zones = self._skin_zones(P, half)
+
+        cover, on_skin = {}, []
+        for ci, f in enumerate(cf):
+            votes, offs = {}, {}
+            on = tot = 0.0
+            for q in f.get("p") or []:
+                if len(q) < 7:
+                    continue
+                p = (q[0] + dx, q[1], q[2])
+                if self._skin_exempt(p, P, half, zones):
+                    continue
+                tot += q[3]
+                s_ = nearest(p)
+                if s_ is None:
+                    continue
+                if sum(q[4 + i] * s_[3 + i] for i in range(3)) \
+                        < TOL["skin_normal_dot"]:
+                    continue
+                off = sum((p[i] - s_[i]) * s_[3 + i] for i in range(3))
+                if abs(off) > TOL["skin_on_mm"]:
+                    continue
+                on += q[3]
+                key = (s_[6], 1 if p[0] > P else -1)
+                votes[key] = votes.get(key, 0.0) + q[3]
+                offs[key] = offs.get(key, 0.0) + q[3] * off
+            if tot <= 0 or on < TOL["skin_face_frac"] * tot or not votes:
+                continue
+            on_skin.append(ci)
+            for key, a in votes.items():
+                if a >= TOL["skin_piece_min_mm2"]:
+                    cover.setdefault(key, []).append(
+                        (a, offs[key] / a, [round(v, 1) for v in f["c"]]))
+
+        extra, pieces = 0.0, []
+        for (fi, side), lst in cover.items():
+            if len(lst) < 2:
+                continue
+            lst.sort(key=lambda r: -r[0])
+            base = lst[0][1]
+            for a, off, c in lst[1:]:
+                if abs(off - base) < TOL["skin_step_mm"]:
+                    continue
+                extra += a
+                pieces.append({"seed_face": fi, "side": side,
+                               "area_mm2": round(a, 1),
+                               "step_mm": round(off - base, 3),
+                               "centroid_mm": c})
+        pieces.sort(key=lambda r: -r["area_mm2"])
+        return extra, {"extra_mm2": round(extra, 1),
+                       "faces_on_skin": on_skin,
+                       "pieces": pieces[:10]}
+
     def c5_unrequested(self):
         det = {}
 
@@ -2233,7 +2605,7 @@ class Grader:
         # shape cannot be compared against the seed's. It is also a door,
         # and `adversarial_unrequested_change_elsewhere` walks through it:
         # it is the reference plus one small cut on the housing, scores
-        # 7.000 of 7.0, and every criterion is right to give it full
+        # 8.000 of 8.0, and every criterion is right to give it full
         # marks, because every criterion is measuring something else.
         #
         # NO THRESHOLD IS SET, and that is a measured decision rather than
@@ -2289,10 +2661,32 @@ class Grader:
         # to 7.750 -- a quarter of a point, the most an unrequested change
         # could ever cost. Either half failing means an unrequested change
         # was made, so the criterion now reports the one that failed.
-        score = min(span, shape)
+        # 5.4 -- skin splits: a new face cut into an old one (see
+        # _skin_splits). Continuous: free below the tessellation floor,
+        # half lost by skin_half_mm2 (any real insert is a real defect),
+        # then down to 0.
+        sk = self._skin_splits()
+        if sk is None:
+            skin = 1.0
+            det["skin_splits"] = {"note": "capture predates housing_faces "
+                                          "(schema /6): not checked"}
+        else:
+            a, det["skin_splits"] = sk
+            if a <= TOL["skin_perfect_mm2"]:
+                skin = 1.0
+            elif a <= TOL["skin_half_mm2"]:
+                skin = 1.0 - 0.5 * (a - TOL["skin_perfect_mm2"]) / (
+                    TOL["skin_half_mm2"] - TOL["skin_perfect_mm2"])
+            else:
+                skin = 0.5 * score_error(a - TOL["skin_half_mm2"], 0.0,
+                                         TOL["skin_zero_mm2"]
+                                         - TOL["skin_half_mm2"])
+
+        score = min(span, shape, skin)
         return {"score": round(score, 4), "status": status_of(score),
                 "components": {"yz_spans": round(span, 4),
-                               "body_shapes": round(shape, 4)},
+                               "body_shapes": round(shape, 4),
+                               "skin_splits": round(skin, 4)},
                 "detail": det,
                 "caveat": "housing, button diamonds and centre buttons are "
                           "exempt from the reshape check -- the reference "
@@ -2351,7 +2745,12 @@ class Grader:
         report["criteria"][C_HYGIENE] = self.c0_hygiene()
 
         rb = self.ms.get("rebuild", {})
-        if not rb.get("ok", False):
+        # A rebuild that could not even be run (errors < 0) or was never
+        # censused leaves nothing to trust: zero as before. A tree that
+        # rebuilt WITH errors is measured, and its geometry is discounted
+        # by the health score below instead of being zeroed.
+        if (not rb.get("ok", False)
+                and (rb.get("errors") is None or rb.get("errors", 0) < 0)):
             for k in names:
                 report["criteria"][k] = {
                     "score": 0.0, "status": FAIL,
@@ -2388,6 +2787,26 @@ class Grader:
         report["criteria"][names[3]] = self.c4_handedness()
         report["criteria"][names[4]] = self.c5_unrequested()
         report["criteria"][C_MARKINGS] = self.c7_markings()
+
+        # TRUST, NOT A GATE. This used to zero all six geometry criteria on
+        # any newly broken feature, so a model whose tree carried errors but
+        # whose geometry was mostly right scored the same as one in ruins,
+        # and the criteria it actually got wrong were never measured. What
+        # the errors did to the shape is already in the geometry scores;
+        # the multiplier only discounts how far a broken rebuild's
+        # measurements can be believed.
+        if not rb.get("ok", False):
+            trust = report["criteria"][C_HEALTH]["score"]
+            for k in names:
+                c = report["criteria"][k]
+                c["measured_score"] = c["score"]
+                c["score"] = round(c["score"] * trust, 4)
+                c["status"] = status_of(c["score"])
+                c["trust_multiplier"] = trust
+            report["notes"].append(
+                f"tree rebuilds with {rb.get('errors')} newly broken "
+                f"feature(s): geometry measured, then scaled by rebuild "
+                f"health {trust:.3f}")
 
         # A plane the harness had to borrow from the baseline means the
         # part's own symmetry could not be read; sidedness rests on an
@@ -2645,6 +3064,7 @@ def capture_baseline(path, out_path=None):
     hfaces = housing_faces(raw, roles.get("housing", []))
     sig = housing_signature(hfaces, plane)
     detail = housing_detail_side(hfaces, plane)
+    halves = housing_halves(hfaces, plane)
     lights = find_light_cluster_seed(hfaces, plane, gmin + gmax)
     intf = control_interference(raw, bodies, roles)
 
@@ -2670,7 +3090,9 @@ def capture_baseline(path, out_path=None):
         "small_face_counts": smf,
         "housing_signature": sig,
         "housing_detail": detail,
+        "housing_halves": halves,
         "light_cluster": lights,
+        "housing_faces": housing_face_list(raw, roles.get("housing", [])),
         "interference": {"tested_pairs": intf["tested_pairs"],
                          "pairs": intf["pairs"],
                          "total_volume_m3": intf["total_volume_m3"]},
@@ -2789,7 +3211,10 @@ def discover_models(task_dir):
         found["solution"] = ref
     ex = task_dir / "examples"
     if ex.is_dir():
-        for p in sorted(ex.glob("*.SLDPRT")):
+        # each adversarial ships in its own examples/<name>/ folder
+        for p in sorted(ex.rglob("*.SLDPRT")):
+            if p.name.startswith("~$"):      # SolidWorks lock file
+                continue
             # examples/solution.SLDPRT is byte-identical to the reference
             # (same sha256 in task.toml). Kept as a determinism check, but
             # labelled so it is not mistaken for an adversarial.
@@ -2801,6 +3226,8 @@ def discover_models(task_dir):
 
     if not found:
         for p in sorted(task_dir.rglob("*.SLDPRT")):
+            if p.name.startswith("~$"):
+                continue
             label, n = p.stem, 2
             while label in found:
                 label, n = f"{p.stem}_{n}", n + 1
