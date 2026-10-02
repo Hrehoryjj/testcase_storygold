@@ -140,7 +140,7 @@
   "handedness": "mirror about plane_x (dpad <-> face_buttons swap sides)"
  },
  "plane_x_m": 0.08050000171522832,
- "plane_x_measured_m": 0.07309996046349326,
+ "plane_x_measured_m": 0.07309996046349325,
  "criteria": {
   "rebuild health": {
    "score": 0.0893,
@@ -342,15 +342,158 @@
   "no new control interference": {
    "score": 0.0,
    "status": "FAIL",
+   "components": {
+    "interference": 0.0,
+    "seated_in_openings": 0.6667,
+    "clearances": 0.7703
+   },
+   "seated": [
+    {
+     "body": "c13",
+     "role": "centre",
+     "bore_radius_mm": {
+      "seed": 9.0,
+      "got": 0.5
+     },
+     "offset_mm": 13.06,
+     "score": 0.0
+    },
+    {
+     "body": "c00",
+     "role": "sticks",
+     "bore_radius_mm": {
+      "seed": 17.0,
+      "got": 17.0
+     },
+     "offset_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c19",
+     "role": "sticks",
+     "bore_radius_mm": {
+      "seed": 17.0,
+      "got": 17.0
+     },
+     "offset_mm": 0.0,
+     "score": 1.0
+    }
+   ],
+   "clearances": [
+    {
+     "body": "c14",
+     "role": "dpad",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.082,
+     "worst_narrowing_mm": 0.022,
+     "score": 1.0
+    },
+    {
+     "body": "c18",
+     "role": "dpad",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.082,
+     "worst_narrowing_mm": 0.507,
+     "score": 0.206
+    },
+    {
+     "body": "c17",
+     "role": "dpad",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.082,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c16",
+     "role": "dpad",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.082,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c02",
+     "role": "centre",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.1,
+     "worst_narrowing_mm": 0.476,
+     "score": 0.2754
+    },
+    {
+     "body": "c08",
+     "role": "centre",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.091,
+     "worst_narrowing_mm": 0.524,
+     "score": 0.1689
+    },
+    {
+     "body": "c13",
+     "role": "centre",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.026,
+     "worst_narrowing_mm": 0.437,
+     "score": 0.363
+    },
+    {
+     "body": "c00",
+     "role": "sticks",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.127,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c19",
+     "role": "sticks",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.127,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c05",
+     "role": "triggers",
+     "rays_compared": 6,
+     "seed_min_gap_mm": -0.0,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c10",
+     "role": "triggers",
+     "rays_compared": 6,
+     "seed_min_gap_mm": -0.0,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c09",
+     "role": "bumpers",
+     "rays_compared": 6,
+     "seed_min_gap_mm": -0.0,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c12",
+     "role": "bumpers",
+     "rays_compared": 6,
+     "seed_min_gap_mm": -0.0,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    }
+   ],
    "seed_total_m3": 0.0,
-   "measured_total_m3": 1.0128923649976878e-06,
-   "growth_m3": 1.0128923649976878e-06,
+   "measured_total_m3": 1.0128923649976872e-06,
+   "growth_m3": 1.0128923649976872e-06,
    "growth_mm3": 1012.8924,
    "free_growth_mm3": 5.0,
    "zero_at_mm3": 50.0,
    "measured_pairs": 4,
    "boolean_failures": 0,
-   "evidence": "boolean-intersect volume among control bodies and control-vs-housing.  Hardware the candidate adds (screws in bosses) is out of scope -- the reference seats screws by design",
+   "evidence": "boolean-intersect volume among control bodies and control-vs-housing; every control that sits on the axis of a round housing opening in the seed must still sit on one; and no control's gap to its own opening may narrow.  Hardware the candidate adds (screws in bosses) is out of scope -- the reference seats screws by design",
    "measured_score": 0.0,
    "trust_multiplier": 0.0893
   },
@@ -488,7 +631,7 @@
        "status": "FAIL",
        "witness": "Ixy",
        "seed": -1.2424623780254225e-12,
-       "measured": -2.277570093704298e-12
+       "measured": -2.277570093704299e-12
       },
       "c17": {
        "role": "dpad",
@@ -501,7 +644,7 @@
        "status": "FAIL",
        "witness": "Ixy",
        "seed": 1.2424623780254225e-12,
-       "measured": 1.4511060326891788e-26
+       "measured": 1.4526667947462712e-26
       }
      },
      "verifiable_bodies": 2
@@ -517,7 +660,7 @@
     },
     "housing_side_signature": {
      "baseline_moment3": 2.3292803892978755e-07,
-     "measured_moment3": 6.237239837569775e-07,
+     "measured_moment3": 6.237239837570329e-07,
      "housing_remodeled": true,
      "score": null,
      "status": "UNVERIFIABLE",
@@ -568,7 +711,7 @@
      "runner_up_margin": 0.06689
     },
     "sticks": {
-     "hypothesis": "identity",
+     "hypothesis": "mirrored",
      "cost_mirrored": 0.004,
      "cost_identity": 0.004,
      "runner_up_margin": 3.32
@@ -590,12 +733,14 @@
    "trust_multiplier": 0.0893
   },
   "no unrequested changes": {
-   "score": 0.0719,
+   "score": 0.0414,
    "status": "PARTIAL",
    "components": {
     "yz_spans": 1.0,
     "body_shapes": 1.0,
-    "skin_splits": 0.8046
+    "skin_splits": 0.8686,
+    "skin_holes": 0.4894,
+    "skin_mirror": 0.4635
    },
    "detail": {
     "spans": {
@@ -638,7 +783,7 @@
      }
     },
     "skin_splits": {
-     "extra_mm2": 35.6,
+     "extra_mm2": 30.5,
      "faces_on_skin": [
       15,
       22,
@@ -659,16 +804,16 @@
       116,
       117,
       118,
+      123,
       202,
+      210,
       217,
       221,
       228,
       230,
       231,
       243,
-      326,
       327,
-      339,
       341,
       428,
       430,
@@ -681,11 +826,12 @@
       437,
       438,
       442,
-      443,
       444,
       445,
       446,
       447,
+      451,
+      505,
       506,
       507,
       508,
@@ -714,58 +860,87 @@
       531,
       532,
       533,
-      534
+      534,
+      594
      ],
      "pieces": [
       {
-       "seed_face": 115,
+       "seed_face": 43,
        "side": -1,
-       "area_mm2": 12.2,
-       "step_mm": -0.161,
-       "centroid_mm": [
-        32.8,
-        -56.5,
-        38.8
-       ]
-      },
-      {
-       "seed_face": 161,
-       "side": -1,
-       "area_mm2": 11.6,
-       "step_mm": -0.168,
-       "centroid_mm": [
-        -6.5,
-        0.8,
-        -1.6
-       ]
-      },
-      {
-       "seed_face": 46,
-       "side": -1,
-       "area_mm2": 6.0,
-       "step_mm": -0.14,
-       "centroid_mm": [
-        -38.0,
-        -58.6,
-        20.6
-       ]
-      },
-      {
-       "seed_face": 160,
-       "side": -1,
-       "area_mm2": 5.8,
-       "step_mm": -0.234,
+       "area_mm2": 16.3,
+       "step_mm": -0.101,
        "centroid_mm": [
         -34.0,
         -35.7,
         56.5
        ]
+      },
+      {
+       "seed_face": 196,
+       "side": 1,
+       "area_mm2": 14.2,
+       "step_mm": -0.107,
+       "centroid_mm": [
+        180.2,
+        -35.7,
+        56.5
+       ]
+      }
+     ]
+    },
+    "skin_holes": {
+     "extra_mm2": 101.0,
+     "samples": "mesh resampled at 1.5 mm",
+     "shell_move_mm": {
+      "left": 0.3500000000000001,
+      "right": -0.1499999999999999
+     },
+     "controls_move_mm": 0.1,
+     "remodelled_mm2": 8196.3,
+     "holes": [
+      {
+       "seed_face": 35,
+       "side": -1,
+       "area_mm2": 101.0,
+       "cells": 66,
+       "at_mm": [
+        -34.4,
+        0.8,
+        5.4
+       ]
+      }
+     ]
+    },
+    "skin_mirror": {
+     "extra_mm2": 201.8,
+     "rebuilt_faces": 7,
+     "mirror_plane_x_mm": 80.5,
+     "samples_checked": 19077,
+     "one_sided_rebuild_mm2": 2688.6,
+     "patches": [
+      {
+       "area_mm2": 101.3,
+       "cells": 53,
+       "at_mm": [
+        -27.7,
+        -85.3,
+        59.1
+       ]
+      },
+      {
+       "area_mm2": 100.5,
+       "cells": 55,
+       "at_mm": [
+        173.2,
+        -87.6,
+        62.3
+       ]
       }
      ]
     }
    },
-   "caveat": "housing, button diamonds and centre buttons are exempt from the reshape check -- the reference remodels them.  Sticks/triggers/bumpers must keep their shape.  Scored by weight, not as a gate.  Inside the housing, skin_splits catches a shallow insert (0.1 to 0.3 mm) on skin the task did not ask to change; a taller one, or one on the reshaped grips or near a control, is not caught: see detail.tree_and_faces for the trace it leaves.",
-   "measured_score": 0.8046,
+   "caveat": "housing, button diamonds and centre buttons are exempt from the reshape check -- the reference remodels them.  Sticks/triggers/bumpers must keep their shape.  Scored by weight, not as a gate.  Inside the housing, on skin the task did not ask to change, skin_splits catches a shallow insert (0.1 to 0.3 mm) and skin_holes an edit of any height that removes skin (boss, pocket, hole), and skin_mirror a one-sided edit on a face the candidate rebuilt (the reference reshapes its grips symmetrically).  Not caught: an edit near a control or the plane, under 0.3 mm or made on both halves alike on a rebuilt face, or smaller than 20 mm2 of missing skin: see detail.tree_and_faces for the trace it leaves.",
+   "measured_score": 0.4635,
    "trust_multiplier": 0.0893
   },
   "markings preserved": {
@@ -787,9 +962,9 @@
       11
      ],
      "candidate": [
+      0,
       10,
       5,
-      0,
       7
      ],
      "note": "NOT SCORED -- the reference rebuilds the cross and simplifies its arrows (44 faces in the seed, 20 in every converted model), so this separates nothing and would charge the reference for it."
@@ -813,6 +988,6 @@
    "unmatched": 4
   }
  },
- "overall_score": 0.1004,
+ "overall_score": 0.0966,
  "overall": "PARTIAL"
 }

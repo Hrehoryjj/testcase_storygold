@@ -165,15 +165,230 @@
   "no new control interference": {
    "score": 0.0,
    "status": "FAIL",
+   "components": {
+    "interference": 0.0,
+    "seated_in_openings": 0.7143,
+    "clearances": 0.6471
+   },
+   "seated": [
+    {
+     "body": "c04",
+     "role": "face_buttons",
+     "bore_radius_mm": {
+      "seed": 9.5,
+      "got": 9.5
+     },
+     "offset_mm": 0.16,
+     "score": 1.0
+    },
+    {
+     "body": "c15",
+     "role": "face_buttons",
+     "bore_radius_mm": {
+      "seed": 9.5,
+      "got": 9.5
+     },
+     "offset_mm": 0.15,
+     "score": 1.0
+    },
+    {
+     "body": "c11",
+     "role": "face_buttons",
+     "bore_radius_mm": {
+      "seed": 9.5,
+      "got": 9.5
+     },
+     "offset_mm": 0.16,
+     "score": 1.0
+    },
+    {
+     "body": "c07",
+     "role": "face_buttons",
+     "bore_radius_mm": {
+      "seed": 9.5,
+      "got": 9.5
+     },
+     "offset_mm": 0.14,
+     "score": 1.0
+    },
+    {
+     "body": "c13",
+     "role": "centre",
+     "bore_radius_mm": {
+      "seed": 9.0,
+      "got": 9.0
+     },
+     "offset_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c00",
+     "role": "sticks",
+     "bore_radius_mm": {
+      "seed": 17.0,
+      "got": 17.0
+     },
+     "offset_mm": 7.5,
+     "score": 0.0
+    },
+    {
+     "body": "c19",
+     "role": "sticks",
+     "bore_radius_mm": {
+      "seed": 17.0,
+      "got": 17.0
+     },
+     "offset_mm": 7.5,
+     "score": 0.0
+    }
+   ],
+   "clearances": [
+    {
+     "body": "c14",
+     "role": "dpad",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.082,
+     "worst_narrowing_mm": 0.001,
+     "score": 1.0
+    },
+    {
+     "body": "c18",
+     "role": "dpad",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.082,
+     "worst_narrowing_mm": 0.001,
+     "score": 1.0
+    },
+    {
+     "body": "c17",
+     "role": "dpad",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.082,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c16",
+     "role": "dpad",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.082,
+     "worst_narrowing_mm": 0.001,
+     "score": 1.0
+    },
+    {
+     "body": "c04",
+     "role": "face_buttons",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.033,
+     "worst_narrowing_mm": 0.019,
+     "score": 1.0
+    },
+    {
+     "body": "c15",
+     "role": "face_buttons",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.032,
+     "worst_narrowing_mm": 0.011,
+     "score": 1.0
+    },
+    {
+     "body": "c11",
+     "role": "face_buttons",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.032,
+     "worst_narrowing_mm": 0.019,
+     "score": 1.0
+    },
+    {
+     "body": "c07",
+     "role": "face_buttons",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.032,
+     "worst_narrowing_mm": 0.004,
+     "score": 1.0
+    },
+    {
+     "body": "c02",
+     "role": "centre",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.1,
+     "worst_narrowing_mm": 0.0,
+     "score": 1.0
+    },
+    {
+     "body": "c08",
+     "role": "centre",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.091,
+     "worst_narrowing_mm": 0.004,
+     "score": 1.0
+    },
+    {
+     "body": "c13",
+     "role": "centre",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.026,
+     "worst_narrowing_mm": 0.009,
+     "score": 1.0
+    },
+    {
+     "body": "c00",
+     "role": "sticks",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.127,
+     "worst_narrowing_mm": 2.125,
+     "score": 0.0
+    },
+    {
+     "body": "c19",
+     "role": "sticks",
+     "rays_compared": 16,
+     "seed_min_gap_mm": 0.127,
+     "worst_narrowing_mm": 2.125,
+     "score": 0.0
+    },
+    {
+     "body": "c05",
+     "role": "triggers",
+     "rays_compared": 7,
+     "seed_min_gap_mm": -0.0,
+     "worst_narrowing_mm": 2.938,
+     "score": 0.0
+    },
+    {
+     "body": "c10",
+     "role": "triggers",
+     "rays_compared": 7,
+     "seed_min_gap_mm": -0.0,
+     "worst_narrowing_mm": 2.999,
+     "score": 0.0
+    },
+    {
+     "body": "c09",
+     "role": "bumpers",
+     "rays_compared": 8,
+     "seed_min_gap_mm": -0.0,
+     "worst_narrowing_mm": 2.198,
+     "score": 0.0
+    },
+    {
+     "body": "c12",
+     "role": "bumpers",
+     "rays_compared": 8,
+     "seed_min_gap_mm": -0.0,
+     "worst_narrowing_mm": 2.196,
+     "score": 0.0
+    }
+   ],
    "seed_total_m3": 0.0,
-   "measured_total_m3": 9.612102816742339e-06,
-   "growth_m3": 9.612102816742339e-06,
+   "measured_total_m3": 9.612102816742335e-06,
+   "growth_m3": 9.612102816742335e-06,
    "growth_mm3": 9612.1028,
    "free_growth_mm3": 5.0,
    "zero_at_mm3": 50.0,
    "measured_pairs": 6,
    "boolean_failures": 0,
-   "evidence": "boolean-intersect volume among control bodies and control-vs-housing.  Hardware the candidate adds (screws in bosses) is out of scope -- the reference seats screws by design"
+   "evidence": "boolean-intersect volume among control bodies and control-vs-housing; every control that sits on the axis of a round housing opening in the seed must still sit on one; and no control's gap to its own opening may narrow.  Hardware the candidate adds (screws in bosses) is out of scope -- the reference seats screws by design"
   },
   "left-handed layout achieved": {
    "score": 0.0,
@@ -415,7 +630,9 @@
    "components": {
     "yz_spans": 1.0,
     "body_shapes": 1.0,
-    "skin_splits": 1.0
+    "skin_splits": 1.0,
+    "skin_holes": 1.0,
+    "skin_mirror": 1.0
    },
    "detail": {
     "spans": {
@@ -464,19 +681,37 @@
       27,
       28,
       30,
+      109,
       148,
       149,
       154,
       164,
+      185,
       263,
+      302,
       303,
       308,
       316
      ],
      "pieces": []
+    },
+    "skin_holes": {
+     "extra_mm2": 0.0,
+     "samples": "mesh resampled at 1.5 mm",
+     "shell_move_mm": {
+      "left": 7.25,
+      "right": 7.25
+     },
+     "controls_move_mm": 0.0,
+     "remodelled_mm2": 0.0,
+     "holes": []
+    },
+    "skin_mirror": {
+     "extra_mm2": 0.0,
+     "rebuilt_faces": 0
     }
    },
-   "caveat": "housing, button diamonds and centre buttons are exempt from the reshape check -- the reference remodels them.  Sticks/triggers/bumpers must keep their shape.  Scored by weight, not as a gate.  Inside the housing, skin_splits catches a shallow insert (0.1 to 0.3 mm) on skin the task did not ask to change; a taller one, or one on the reshaped grips or near a control, is not caught: see detail.tree_and_faces for the trace it leaves."
+   "caveat": "housing, button diamonds and centre buttons are exempt from the reshape check -- the reference remodels them.  Sticks/triggers/bumpers must keep their shape.  Scored by weight, not as a gate.  Inside the housing, on skin the task did not ask to change, skin_splits catches a shallow insert (0.1 to 0.3 mm) and skin_holes an edit of any height that removes skin (boss, pocket, hole), and skin_mirror a one-sided edit on a face the candidate rebuilt (the reference reshapes its grips symmetrically).  Not caught: an edit near a control or the plane, under 0.3 mm or made on both halves alike on a rebuilt face, or smaller than 20 mm2 of missing skin: see detail.tree_and_faces for the trace it leaves."
   },
   "markings preserved": {
    "score": 1.0,

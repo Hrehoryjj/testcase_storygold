@@ -26,7 +26,8 @@ python tests\task\harness\harness.py --capture-baseline path\to\seed.SLDPRT
 ```
 
 **1. Prove the connection with one part.** Do not open with the whole corpus:
-it is 16–29 s per part, and if COM did not attach you want to know now.
+it is about 40 to 50 s per part (measuring plus scoring), and if COM did
+not attach you want to know now.
 
 ```bat
 python tests\task\harness\harness.py reference.SLDPRT
@@ -47,7 +48,8 @@ python tests\task\harness\harness.py --batch reference.SLDPRT examples --capture
 its stem. Captures land in `results\captures\`, and the command prints the
 line that scores them.
 
-**3. Score.** Milliseconds, and no SolidWorks involved at all:
+**3. Score.** About 20 s per part on one core (the skin and clearance checks
+walk the full meshes), and no SolidWorks involved at all:
 
 ```bat
 python tests\task\harness\harness.py --batch --score-from results\captures
@@ -78,8 +80,8 @@ pass, and that is fine for a one-off. But then every threshold or formula
 change costs another trip through SolidWorks.
 
 Measuring needs SolidWorks and takes 15–30 s per part. Scoring is arithmetic
-over two dictionaries. Split them and you measure once and re-score as often
-as you like — which also turns the stored captures into a regression suite
+over two dictionaries, about 20 s per part since the mesh checks (2.5.0).
+Split them and you measure once and re-score as often as you like — which also turns the stored captures into a regression suite
 that needs no CAD: change the harness, re-run step 3, see immediately which
 models moved.
 
@@ -123,7 +125,7 @@ batch mode never touches its shape:
   "no unrequested changes": 1.0,
   "markings preserved": 1.0
  },
- "harness_version": "2.4.0"
+ "harness_version": "2.5.0"
 }
 ```
 
@@ -164,6 +166,48 @@ corpus that ordering holds from a factor of 1.37 up, and 1.5 is the nearest
 round value above it. That threshold comes from this corpus, not from the
 task, and is stated as such. A rebuild that could not run at all still zeroes
 the geometry.
+
+#### Controls stay seated in their openings
+
+`no new control interference` takes the weakest of three readings. The first is
+the boolean-intersect volume among the controls and against the housing. The
+second (2.5.0) is that every control whose centre sits on the axis of a round
+housing opening in the seed (the sticks, the face buttons, the PS button)
+still sits on the axis of one in the candidate: free up to 1 mm off, zero at
+5 mm, averaged over those controls. The bore it sits in (the smallest
+opening on its axis) must also keep the seed's radius: free within 0.2 mm,
+zero at 2 mm. Drafted (conical) bores count as openings, without a radius
+comparison. It reads only body centroids and the housing's own cylinders and
+cones, so it asks the candidate to be consistent with
+itself, not to match the reference. A control can clear the housing and still
+sit beside the hole it belongs in; this sees that. On the shipped corpus it
+changes no total: the models it fires on (sticks 7.5 mm off their openings in
+`adversarial_widened_15mm_clusters_at_original_spacing` and in the two broken
+models) already lose this criterion through interference.
+
+#### Every control keeps its gap to its own opening
+
+Coaxiality covers round openings only, and the interference volume forgives
+up to 5 mm3. The third reading (2.5.0) covers every control, round or not.
+From the meshes in the capture it takes horizontal sections through the
+control every 0.5 mm, casts 16 rays around it, and keeps on each ray the
+tightest gap between the control and the housing. The seed's gaps are
+compared with the candidate's, each inside its own part, so neither the frame
+nor the widening enters. Only narrowing is charged: free up to 0.15 mm, zero
+at 0.6 mm, averaged over the controls. Widening is allowed because the
+reference itself opens up its stick rings (about 1.2 mm) and its face-button
+wells (up to 6 mm). Each control is compared with the closest seed pattern of
+its own kind, in either handedness, so a matcher that pairs two look-alike
+buttons the other way round is not mistaken for a moved button.
+
+On the reference no gap narrows by more than 0.008 mm. A control pushed
+0.3 mm sideways in its opening loses this criterion and nothing else. On the
+shipped corpus it found one defect the examples do not advertise: in
+`adversarial_only_one_button_cluster_mirrored` a face button sits 0.19 mm
+closer to the wall of its well than any seed button, 0.09 mm into it, under
+the interference allowance. That costs the model 0.003 points and changes no
+ranking. Captures older than schema /7 carry no meshes; for them this reading
+is skipped with a note.
 
 #### `passed` means flawless, not "good enough"
 
@@ -221,9 +265,12 @@ from, measured the way this harness measures.
 python tests\task\harness\harness.py --capture-baseline ..\SolidWorks\1_playstation_controller\environment\input.SLDPRT
 ```
 
-The shipped baseline is the upstream one plus two blocks taken from a fresh
-schema /6 capture of the same seed: `housing_halves` (for the width
-criterion) and `housing_faces` (for the skin-split check), one face per line.
+The shipped baseline is the upstream one plus three blocks taken from a fresh
+schema /7 capture of the same seed (body ids mapped to the baseline's by
+centroid): `housing_halves` (for the width criterion), `housing_faces` (every
+housing face with its full tessellation and its cylinder or cone axis, for the
+skin checks and the opening checks) and `control_meshes` (the tessellation of
+every control, for the clearance check). The meshes make the file about 3.4 MB; captures and the baseline keep each list of numbers on one line.
 
 Re-measures the seed and rewrites the whole baseline. Run it when the seed
 part changes, when the harness starts recording something it did not record
@@ -271,9 +318,21 @@ the reference capture, and asserts:
   models with rebuild errors may lose anywhere, since health scales them);
 - the reference cut at the mirror plane into left and right pieces, another
   valid way to widen, still scores 8.0;
-- on faces the skin-split check covers, a 0.15 to 0.25 mm step (raised or
-  sunk) costs `no unrequested changes` and nothing else, and a zero-height
-  split line on the same face costs nothing.
+- on faces the skin checks cover, a 0.15 to 0.25 mm step (raised or
+  sunk), and a boss, pocket or through hole 16 mm across, cost
+  `no unrequested changes` and nothing else, and a zero-height split line on
+  the same face costs nothing;
+- a control pushed 0.3 mm sideways in its opening costs
+  `no new control interference` and nothing else.
+
+```bash
+python3 tools/sweep_synthetic.py 20
+```
+
+Measures what `no unrequested changes` catches: boss, pocket and hole edits
+at random spots on the skin the task did not ask to change. Slow: each grade
+takes about 25 s, so 320 grades take about two hours on one core. Results are in
+NOTES.md at the repository root.
 
 This validates the **scoring logic**, not the measurement layer — `capture()`,
 `assign_roles()` and the port-light face matching all read live geometry.
@@ -308,19 +367,30 @@ This validates the **scoring logic**, not the measurement layer — `capture()`,
   +15.0. For the same reason "controls follow the grips" is reported in the
   cluster criterion but not scored. The halves witness is a proxy: hollowing
   the shell or adding large faces also moves it.
-- **Unrequested edits the skin-split check cannot see.** `no unrequested
-  changes` now also looks for a new face cut into an old one on the part of
-  the housing the task did not ask to change (the seed skin moved by the
-  task rule, minus the widening strip and an 8 mm margin around every
-  control). It catches shallow inserts, 0.1 to 0.3 mm proud or sunk, which
-  is what `adversarial_unrequested_change_elsewhere` is (a 0.15 mm band).
-  It does not see an addition taller than 0.3 mm, an edit on the grips the
-  reference legitimately reshapes, an edit inside a control margin, or a
-  fillet. Widening its tolerance to 1.0 mm made the reference itself lose
-  0.25 points, so it was left at 0.3 mm. Its samples come from SolidWorks
-  tessellation, so a much coarser image-quality setting can hide an insert
-  (it cannot invent one). An earlier zone check on feature footprints was
-  rejected because it flagged 16 features of the reference.
+- **Unrequested edits the skin checks cannot see.** `no unrequested
+  changes` looks at the part of the housing the task did not ask to change:
+  the seed skin moved onto the candidate, minus the widening strip and an
+  8 mm margin around every control. Three checks share it. `skin_splits`
+  (2.4.0) finds a new face cut into an old one that stays on the old
+  surface: a shallow insert 0.1 to 0.3 mm proud or sunk, which is what
+  `adversarial_unrequested_change_elsewhere` is (a 0.15 mm band).
+  `skin_holes` (2.5.0) finds a patch of an otherwise intact old face that is
+  no longer there: a boss, pocket or hole of any height. From schema /7 the
+  seed mesh is resampled every 1.5 mm and each point asks the candidate's
+  own triangles for same-facing surface within 0.3 mm (no sideways
+  allowance, patches judged by size and grouped across face edges). The
+  seed skin is moved by the controls' widening and by the shell's own move,
+  registered per side, so a candidate that widens the shell more than its
+  controls (as the reference does) is not charged. On a face the candidate
+  rebuilt (less than 80% of it in place; the reference reshapes its grips,
+  about 8,000 mm2) a patch of 60 to 500 mm2 still counts, and `skin_mirror`
+  (2.5.0) compares the candidate there with its own mirror image, since any
+  honest rebuild stays symmetric. What none sees: an edit inside a control
+  margin or the strip, an edit under 0.3 mm or made on both halves alike on
+  a rebuilt face, a 0.5 mm offset on a face along the widening axis, and a
+  fillet on an edge. `tools/sweep_synthetic.py` measures this on random
+  spots (258 of 320 edits caught). Samples come from SolidWorks tessellation, so a
+  much coarser image-quality setting can hide an edit; it cannot invent one.
 - **How much confidence the sidedness verdict deserves.** On genuinely
   edited models the guard rests on ONE readable witness: the port-light
   glyphs, because `housing_side_signature` returns `UNVERIFIABLE` whenever
