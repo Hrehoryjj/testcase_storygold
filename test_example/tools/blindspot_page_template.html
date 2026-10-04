@@ -1,0 +1,276 @@
+<title>Grader Blind-Spot Map</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Saira+Semi+Condensed:wght@500;700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: an instrument readout. The 3D part is the hero, its scale bar sits under it
+   like a contour legend, figures and method follow in one narrow column. */
+:root {
+  --bg: #f3f5f6; --panel: #ffffff; --fg: #18222b; --muted: #5b6873; --line: #d5dce1;
+  --accent: #1f6f8b; --caught: #2a7f9e; --mid: #e3a538; --missed: #c4462f;
+  --exempt: #c9c3b6; --margin: #8a74c4; --same: #d3d9dd; --reshaped: #b7791f; --unmeasured: #dfe3e6; --stage: #e8ecef; --dot: #18222b;
+  --display: "Saira Semi Condensed", "Arial Narrow", sans-serif;
+  --body: "Source Sans 3", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #11171c; --panel: #182128; --fg: #e3e9ed; --muted: #95a3ad; --line: #2b3740;
+  --accent: #6cb8d4; --caught: #4aa3c4; --mid: #e8b04b; --missed: #e0644b;
+  --exempt: #5d5a52; --margin: #8f7ad0; --same: #4b565e; --reshaped: #d69a3a; --unmeasured: #3a454d; --stage: #0d1216; --dot: #f1f4f6; color-scheme: dark } }
+:root[data-theme="dark"] {
+  --bg: #11171c; --panel: #182128; --fg: #e3e9ed; --muted: #95a3ad; --line: #2b3740;
+  --accent: #6cb8d4; --caught: #4aa3c4; --mid: #e8b04b; --missed: #e0644b;
+  --exempt: #5d5a52; --margin: #8f7ad0; --same: #4b565e; --reshaped: #d69a3a; --unmeasured: #3a454d; --stage: #0d1216; --dot: #f1f4f6; color-scheme: dark }
+body { background: var(--bg); color: var(--fg); font: 400 1rem/1.55 var(--body); }
+.wrap { max-width: 980px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 56px;
+  display: grid; gap: 28px; }
+header { display: grid; gap: 8px; max-width: 68ch; }
+.eyebrow { font: 600 .75rem/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+h1 { font: 700 clamp(2rem, 6vw, 3.2rem)/1.02 var(--display); margin: 0; text-wrap: balance; letter-spacing: -.01em; }
+h2 { font: 700 1.35rem/1.2 var(--display); margin: 0; text-wrap: balance; }
+p { margin: 0; }
+.lede { color: var(--muted); font-size: 1.08rem; }
+.viewer { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; display: grid; }
+.bar { display: flex; flex-wrap: wrap; gap: 6px; padding: 12px; border-bottom: 1px solid var(--line); align-items: center; }
+.bar .lbl { font: 600 .72rem/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin-right: 4px; }
+.chip { font: 600 .85rem/1 var(--body); padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line);
+  background: transparent; color: var(--fg); cursor: pointer; }
+.chip[aria-pressed="true"] { background: var(--fg); color: var(--bg); border-color: var(--fg); }
+.chip:focus-visible, .reset:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.stage { position: relative; height: min(62vh, 560px); min-height: 320px; background: var(--stage); touch-action: none; }
+.stage canvas { display: block; width: 100%; height: 100%; }
+.hint { position: absolute; left: 12px; top: 10px; right: 12px; font: 400 .78rem/1.3 var(--mono); color: var(--muted); }
+.cam { position: absolute; right: 10px; bottom: 8px; display: flex; gap: 6px; }
+.reset { font: 600 .78rem/1 var(--body); padding: 7px 10px; border-radius: 4px;
+  border: 1px solid var(--line); background: var(--panel); color: var(--fg); cursor: pointer; }
+[hidden] { display: none !important; }
+.legend { display: grid; gap: 10px; padding: 14px 12px; border-top: 1px solid var(--line); }
+.scale { display: grid; gap: 4px; max-width: 520px; }
+.ramp { height: 12px; border-radius: 2px; background: linear-gradient(90deg, var(--missed), var(--mid), var(--caught)); }
+.ticks { display: flex; justify-content: space-between; font: 400 .74rem/1 var(--mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+.scale-title { font: 600 .82rem/1.3 var(--body); }
+.keys { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: .85rem; color: var(--muted); }
+.key { display: inline-flex; align-items: center; gap: 6px; }
+.sw { width: 14px; height: 14px; border-radius: 2px; border: 1px solid var(--line); }
+.figs { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.fig { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 16px; display: grid; gap: 6px; align-content: start; }
+.fig b { font: 700 2.2rem/1 var(--display); font-variant-numeric: tabular-nums; }
+.fig span { color: var(--muted); font-size: .92rem; }
+section { display: grid; gap: 12px; max-width: 68ch; }
+.edits { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.edits th, .edits td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+.edits th { font: 600 .74rem/1.2 var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); }
+.edits td.n { font-family: var(--mono); text-align: right; }
+.tbl { overflow-x: auto; }
+ul { margin: 0; padding-left: 1.2em; display: grid; gap: 6px; }
+pre { margin: 0; padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  font: 400 .82rem/1.5 var(--mono); overflow-x: auto; }
+code { font-family: var(--mono); font-size: .9em; }
+footer { color: var(--muted); font-size: .85rem; border-top: 1px solid var(--line); padding-top: 14px; }
+a { color: var(--accent); }
+.fallback[hidden] { display: none; }
+.fallback { position: absolute; inset: 0; display: grid; place-items: center; padding: 16px; text-align: center; color: var(--muted); }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">CAD grader QA &middot; PS3 controller task</div>
+    <h1>Grader Blind-Spot Map</h1>
+    <p class="lede">An AI that is trained against a grader learns whatever the grader cannot see. This map shows, on the part itself, where the <em>no unrequested changes</em> check notices a small edit nobody asked for, and where it does not.</p>
+  </header>
+
+  <div class="viewer">
+    <div class="bar" role="group" aria-label="View">
+      <span class="lbl">View</span>
+      <span id="chips" style="display:contents"></span>
+      <button class="chip" type="button" id="dots" aria-pressed="false">Show spots</button>
+    </div>
+    <div class="stage" id="stage">
+      <div class="fallback" id="fallback" hidden>The 3D view needs WebGL, which this browser did not provide. The figures below come from the same data.</div>
+      <span class="hint">Drag to rotate &middot; pinch or scroll to zoom</span>
+      <div class="cam"><button class="reset" id="top" type="button">Top</button><button class="reset" id="under" type="button">Underside</button></div>
+    </div>
+    <div class="legend">
+      <div class="scale">
+        <div class="scale-title" id="scaleTitle">Share of the <span data-nreal>four</span> real edits caught at that spot</div>
+        <div class="ramp" id="ramp" aria-hidden="true"></div>
+        <div class="keys" id="seedKeys" hidden><span class="key"><i class="sw" style="background:var(--same)"></i>Same surface as the original part</span><span class="key"><i class="sw" style="background:var(--reshaped)"></i>Surface the reference reshaped: the original part is no template here</span></div>
+        <div class="ticks" id="ticks"><span>0%</span><span>25%</span><span>50%</span><span>75%</span><span>100%</span></div>
+      </div>
+      <div class="keys">
+        <span class="key"><i class="sw" style="background:var(--exempt)"></i>Widening strip: the task changes it, so the check skips it</span>
+        <span class="key"><i class="sw" style="background:var(--margin)"></i>8 mm margin around controls: the check skips it, a real blind spot</span>
+        <span class="key"><i class="sw" style="background:var(--unmeasured)"></i>Inner skin or no spot nearby</span>
+        <span class="key"><i class="sw" style="background:#59626a"></i>Controls</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="figs" id="figs"></div>
+
+  <section>
+    <h2>Per edit</h2>
+    <div class="tbl"><table class="edits" id="edits"><thead><tr><th>Edit, 8 mm across</th><th style="text-align:right">Spots flagged</th><th style="text-align:right">Share</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section id="reading">
+    <h2>What the map says</h2>
+    <!--READING-->
+  </section>
+
+  <section>
+    <h2>How it was measured</h2>
+    <ul>
+      <li>Spots are spread evenly over the outer housing skin of the reference solution, <span id="gap"></span> mm apart. Outer means skin someone can see: from just off the surface, rays cast over the half sphere it faces reach open space. From the inner skin of the hollow housing almost none do. Spots inside the widening strip and the margins around the controls are not edited, because the task asks for changes there.</li>
+      <li>At every spot four real edits are made, one at a time, on the reference's own SolidWorks capture: a 0.15 mm step at the surface tolerance, a 0.5 mm boss, a 3 mm boss and a through hole, each 8 mm across, the same discs as the coverage sweep shipped with the grader, with one fix described below.</li>
+      <li>Two more edits leave the shape as it is and must not be flagged: a split line (the disc becomes its own face at zero height, as an imprinted sketch makes it) and a different tessellation (the disc meshed finer, each vertex moved up to 0.05 mm, as a mesh at another quality setting sits off the true surface). Every flag there is a false alarm.</li>
+      <li>Each edited part is graded by the real check. An edit counts as caught when <em>no unrequested changes</em> drops below full marks. That is <span id="grades"></span> grades, all offline from the capture, no SolidWorks needed.</li>
+      <li>Colour between spots is interpolated from nearby spots that face the same way. Each spot is one deterministic trial, so read patches, not single points; <em>Show spots</em> marks where the measurements are.</li>
+      <li>The edits change the housing surface only, so this maps the skin part of <em>no unrequested changes</em>. The criterion's span and body-shape checks are not exercised here.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Run it on another grader</h2>
+    <p>Pointing the map at another grader or part means swapping two functions in <code>blindspot_map.py</code>: the one that scores an edited capture, and the one that says where the task allows changes. For this grader the second one reuses the check's own zone logic.</p>
+<pre>python3 tools/blindspot_map.py 400 4 blindspots.json
+python3 tools/build_blindspot_page.py blindspot_map.html blindspots.json</pre>
+  </section>
+
+  <footer id="foot">Hryhorii Markevych &middot; follow-up to the StoryGold CAD evaluation take-home &middot; <a href="https://github.com/Hrehoryjj/testcase_storygold" target="_blank" rel="noopener">github.com/Hrehoryjj/testcase_storygold</a></footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+const D = /*DATA*/null;
+const S = D.summary, E = D.views.slice(1).filter(v => v !== "seed"), REAL = S.edits, HARM = S.harmless;
+const WORDS = ["no", "one", "two", "three", "four", "five", "six"];
+const nReal = WORDS[REAL.length] || String(REAL.length);
+const allLabel = REAL.length === 1 ? "The real edit" : `All ${nReal} edits`;
+document.querySelectorAll("[data-nreal]").forEach(el => el.textContent = nReal);
+const pct = (a, b) => Math.round(100 * a / b) + "%";
+const outer = S.spots + S.exempt_strip + S.exempt_controls;
+
+// figures and table
+const fa = HARM.reduce((n, e) => n + S.per_edit[e], 0);
+const figs = [
+  [`${S.every_edit} of ${S.spots}`, `checked spots where all ${nReal} real edits are caught`],
+  ...("boss 3 mm" in S.per_edit ? [[pct(S.per_edit["boss 3 mm"], S.spots), "of checked spots catch a 3 mm boss, an extra anyone would see at once"]] : []),
+  ...(HARM.length ? [[`${fa} of ${S.spots * HARM.length}`, "false alarms on edits that leave the shape as it is"]] : []),
+  ["~" + pct(S.exempt_controls, outer), "of the outer skin lies in the margins around controls, where the check does not look"],
+];
+document.getElementById("figs").innerHTML = figs.map(([b, s]) =>
+  `<div class="fig"><b>${b}</b><span>${s}</span></div>`).join("");
+const name = e => e === "hole" ? "through hole" : HARM.includes(e) ? `${e} (should not be flagged)` : e;
+document.querySelector("#edits tbody").innerHTML = E.map(e =>
+  `<tr><td>${name(e)}</td><td class="n">${S.per_edit[e]} / ${S.spots}</td><td class="n">${pct(S.per_edit[e], S.spots)}</td></tr>`).join("");
+document.getElementById("gap").textContent = S.gap_mm;
+document.getElementById("grades").textContent = (S.spots * E.length).toLocaleString("en");
+
+// view chips
+const label = v => v === "all" ? allLabel : v === "seed" ? "Context: reshaped surface" : v === "hole" ? "Through hole" : HARM.includes(v) ? `False alarms: ${v}` : v.replace("boss", "Boss");
+let view = "all";
+const chips = document.getElementById("chips");
+chips.innerHTML = D.views.map(v => `<button class="chip" type="button" data-v="${v}" aria-pressed="${v === view}">${label(v)}</button>`).join("");
+
+const b64 = (s, T) => { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return new T(u.buffer); };
+const codes = {}; for (const v of D.views) codes[v] = b64(D.codes[v], Uint8Array);
+
+function token(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+function rgb(name) { const c = new THREE.Color(token(name)); return [c.r, c.g, c.b]; }
+const mix = (a, b, t) => a.map((x, i) => x + (b[i] - x) * t);
+
+const stage = document.getElementById("stage");
+let renderer = null;
+if (typeof THREE !== "undefined") {
+  try { renderer = new THREE.WebGLRenderer({ antialias: true }); } catch (e) { renderer = null; }
+}
+if (!renderer || typeof THREE.OrbitControls !== "function") {
+  document.getElementById("dots").hidden = true;
+  document.querySelector(".cam").hidden = true;
+  document.getElementById("fallback").hidden = false;
+} else {
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  stage.prepend(renderer.domElement);
+  const scene = new THREE.Scene();
+  const cam = new THREE.PerspectiveCamera(32, 1, 1, 5000);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x8a96a0, 0.75));
+  const key = new THREE.DirectionalLight(0xffffff, 0.55); key.position.set(0.4, 1, 0.8); cam.add(key); scene.add(cam);
+
+  const u = D.unit;
+  function geom(vs, ts) {
+    const v = b64(vs, Int32Array), t = b64(ts, Uint32Array);
+    const pos = new Float32Array(v.length); for (let i = 0; i < v.length; i++) pos[i] = v[i] * u;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    g.setIndex(new THREE.BufferAttribute(t, 1));
+    return g;
+  }
+  const hg = geom(D.v, D.t);
+  const nv = hg.getAttribute("position").count;
+  const col = new Float32Array(nv * 3);
+  hg.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  const housing = new THREE.Mesh(hg, new THREE.MeshPhongMaterial({ vertexColors: true, flatShading: true, shininess: 12, side: THREE.DoubleSide }));
+  const ctrl = new THREE.Mesh(geom(D.cv, D.ct), new THREE.MeshPhongMaterial({ color: 0x59626a, flatShading: true, shininess: 20 }));
+  const part = new THREE.Group(); part.add(housing, ctrl); scene.add(part);
+  const dp = new Float32Array(D.spots.length * 3);
+  D.spots.forEach((s, i) => dp.set(s.p, 3 * i));
+  const dg = new THREE.BufferGeometry(); dg.setAttribute("position", new THREE.BufferAttribute(dp, 3));
+  const dotMat = new THREE.PointsMaterial({ size: 4, sizeAttenuation: false });
+  const dots = new THREE.Points(dg, dotMat); dots.visible = false; part.add(dots);
+  const dotsBtn = document.getElementById("dots");
+  dotsBtn.onclick = () => { dots.visible = !dots.visible; dotsBtn.setAttribute("aria-pressed", dots.visible); };
+
+  hg.computeBoundingSphere();
+  const bs = hg.boundingSphere, ctr = bs.center.clone();
+  const controls = new THREE.OrbitControls(cam, renderer.domElement);
+  controls.enableDamping = true; controls.target.copy(ctr);
+  // controls face +Y; the shoulders are at -Z. Look down from above and in
+  // front, and turn the part about the vertical like a turntable.
+  cam.up.set(0, 1, 0);
+  const fitDist = () => {
+    const v = THREE.MathUtils.degToRad(cam.fov) / 2;
+    const h = Math.atan(Math.tan(v) * cam.aspect);
+    return (cam.aspect < 1 ? 1.0 : 0.82) * bs.radius / Math.sin(Math.min(v, h));
+  };
+  const home = (s = 1) => { cam.position.copy(ctr).add(new THREE.Vector3(0.2, 0.95 * s, 0.75).normalize().multiplyScalar(fitDist())); controls.target.copy(ctr); controls.update(); };
+  document.getElementById("top").onclick = () => home(1);
+  document.getElementById("under").onclick = () => home(-1);
+
+  function paint() {
+    const lo = rgb("--missed"), mid = rgb("--mid"), hi = rgb("--caught"), ex = rgb("--exempt"), un = rgb("--unmeasured"), mg = rgb("--margin"), same = rgb("--same"), rs = rgb("--reshaped");
+    const c = codes[view];
+    for (let i = 0; i < nv; i++) {
+      const k = c[i];
+      let x;
+      if (k === 255) x = ex; else if (k === 254) x = un; else if (k === 253) x = mg;
+      else if (view === "seed") x = k ? same : rs;
+      else { const t = k / 200; x = t < 0.5 ? mix(lo, mid, t * 2) : mix(mid, hi, (t - 0.5) * 2); }
+      col[3 * i] = x[0]; col[3 * i + 1] = x[1]; col[3 * i + 2] = x[2];
+    }
+    hg.getAttribute("color").needsUpdate = true;
+    scene.background = new THREE.Color(token("--stage"));
+    dotMat.color.set(token("--dot"));
+    const seed = view === "seed";
+    document.getElementById("ramp").hidden = seed;
+    document.getElementById("ticks").hidden = seed;
+    document.getElementById("seedKeys").hidden = !seed;
+    document.getElementById("scaleTitle").textContent = seed ? "Where the reference rebuilt the housing compared with the original part"
+      : view === "all"
+      ? `Share of the ${nReal} real edits caught at that spot`
+      : HARM.includes(view) ? `${view}: correctly left alone (right) or flagged by mistake (left)`
+      : `${label(view)}: caught (right) or missed (left)`;
+  }
+  chips.addEventListener("click", e => {
+    const b = e.target.closest(".chip"); if (!b) return;
+    view = b.dataset.v;
+    chips.querySelectorAll(".chip").forEach(c => c.setAttribute("aria-pressed", c === b));
+    paint();
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", paint);
+  new MutationObserver(paint).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  function size() { const w = stage.clientWidth, h = stage.clientHeight; renderer.setSize(w, h, false); cam.aspect = w / h; cam.updateProjectionMatrix(); }
+  new ResizeObserver(size).observe(stage); size(); home(); paint();
+  (function loop() { controls.update(); renderer.render(scene, cam); requestAnimationFrame(loop); })();
+}
+</script>
