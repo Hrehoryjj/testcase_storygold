@@ -5,9 +5,10 @@
 
 EDITS is a comma list of edit names to run only those. --extend adds spots
 where earlier runs left gaps (at their spacing), for example after the
-outer skin test changed. --at SPOTS.json grades the listed positions again
-(with --extend naming the run whose spacing they keep); the page builder
-lets later result files replace earlier ones spot by spot.
+outer skin test changed. --at SPOTS.json grades the listed positions (a list,
+with --extend naming the run whose spacing they keep, or {"gap_mm", "p"});
+the page builder lets later result files replace earlier ones spot by spot.
+A run whose output file exists continues where it stopped.
 
 sweep_synthetic.py answers "what share of random edits does
 'no unrequested changes' catch". This answers "where on the part are the
@@ -31,6 +32,7 @@ import gzip
 import importlib.util
 import json
 import math
+import os
 import random
 import sys
 import time
@@ -41,8 +43,11 @@ ROOT = Path(__file__).resolve().parents[1]
 TASK = ROOT / "SolidWorks" / "1_playstation_controller"
 CAPS = TASK / "evidence" / "captures"
 
-spec = importlib.util.spec_from_file_location(
-    "harness", TASK / "tests" / "task" / "harness" / "harness.py")
+# the grader under test: this repo's harness, or another copy of it named by
+# BLINDSPOT_HARNESS (how blindspot_audit.py compares two versions)
+HARNESS = Path(os.environ.get("BLINDSPOT_HARNESS") or
+               TASK / "tests" / "task" / "harness" / "harness.py")
+spec = importlib.util.spec_from_file_location("harness", HARNESS)
 H = importlib.util.module_from_spec(spec)
 _argv, sys.argv = sys.argv, sys.argv[:1]
 spec.loader.exec_module(H)
@@ -411,14 +416,28 @@ def _grade_spot(args):
     return row
 
 
+def write(out, edits, gap, rows, spots, exempt):
+    """The results so far, replaced in one step so a stopped run leaves a
+    readable file to resume from."""
+    tmp = out.with_suffix(".tmp")
+    tmp.write_text(json.dumps(
+        {"edits": [e[0] for e in edits], "harmless": sorted(HARMLESS),
+         "gap_mm": round(gap, 1),
+         "harness_version": H.HARNESS_VERSION, "spots": rows,
+         "exempt_spots": [{"p": [round(v, 2) for v in q[:3]],
+                           "kind": exempt(q)}
+                          for q in spots if exempt(q)]}))
+    tmp.replace(out)
+
+
 def main():
     args = sys.argv[1:]
     extend, at = [], None
     if "--extend" in args:      # earlier result files to add spots to
         i = args.index("--extend")
         extend, args = args[i + 1:], args[:i]
-    if "--at" in args:          # a JSON list of spot positions to grade
-        i = args.index("--at")
+    if "--at" in args:          # spot positions to grade, as a JSON list
+        i = args.index("--at")  # or {"gap_mm": .., "p": [..]}
         at = json.loads(Path(args[i + 1]).read_text())
         del args[i:i + 2]
     n = int(args[0]) if len(args) > 0 else 250
@@ -429,13 +448,15 @@ def main():
         edits = [e for e in EDITS if e[0] in args[3].split(",")]
     ref = load("solution")
     exempt = exempt_test(ref)
-    outer = outer_points(ref, workers)
+    outer = outer_points(ref, workers) if at is None else None
     if at is not None:
-        want = {tuple(round(v, 2) for v in p) for p in at}
+        gap = at["gap_mm"] if isinstance(at, dict) else (
+            json.loads(Path(extend[0]).read_text())["gap_mm"]
+            if extend else 0.0)
+        want = {tuple(round(v, 2) for v in p)
+                for p in (at["p"] if isinstance(at, dict) else at)}
         spots = [q for f in ref["housing_faces"] for q in f["p"]
                  if tuple(round(v, 2) for v in q[:3]) in want]
-        gap = json.loads(Path(extend[0]).read_text())["gap_mm"] \
-            if extend else 0.0
     elif extend:
         # new spots only where the earlier runs left a gap, at their spacing
         old = [json.loads(Path(f).read_text()) for f in extend]
@@ -450,10 +471,23 @@ def main():
     else:
         spots, gap = spread(outer, n)
     free = [q for q in spots if not exempt(q)]
+    rows = []
+    if out.exists():            # resume a run that stopped part way
+        d = json.loads(out.read_text())
+        names = [e[0] for e in edits]
+        if (d.get("edits") == names and d.get("gap_mm") == round(gap, 1)
+                and d.get("harness_version") == H.HARNESS_VERSION):
+            want = {tuple(round(v, 2) for v in q[:3]) for q in free}
+            rows = [r for r in d["spots"] if tuple(r["p"]) in want]
+            done = {tuple(r["p"]) for r in rows}
+            free = [q for q in free
+                    if tuple(round(v, 2) for v in q[:3]) not in done]
+            print(f"resuming {out}: {len(rows)} spots already graded",
+                  flush=True)
     print(f"{len(spots)} spots {gap:.1f} mm apart on the outer skin, "
-          f"{len(free)} outside the exempt zones; "
+          f"{len(free)} outside the exempt zones left to grade; "
           f"{len(free) * len(edits)} grades", flush=True)
-    t0, rows = time.time(), []
+    t0 = time.time()
     with Pool(workers) as pool:
         for i, row in enumerate(pool.imap_unordered(
                 _grade_spot, [(q, edits) for q in free])):
@@ -463,15 +497,9 @@ def main():
             print(f"{i + 1}/{len(free)} at {[round(v) for v in row['p']]} "
                   f"wrong on {missed or 'nothing'}  "
                   f"({time.time() - t0:.0f} s)", flush=True)
-            tmp = out.with_suffix(".tmp")
-            tmp.write_text(json.dumps(
-                {"edits": [e[0] for e in edits], "harmless": sorted(HARMLESS),
-                 "gap_mm": round(gap, 1),
-                 "harness_version": H.HARNESS_VERSION, "spots": rows,
-                 "exempt_spots": [{"p": [round(v, 2) for v in q[:3]],
-                                   "kind": exempt(q)}
-                                  for q in spots if exempt(q)]}))
-            tmp.replace(out)
+            write(out, edits, gap, rows, spots, exempt)
+    if not rows or not free:
+        write(out, edits, gap, rows, spots, exempt)
     print(f"wrote {out}")
 
 

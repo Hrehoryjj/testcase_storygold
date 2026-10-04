@@ -129,10 +129,11 @@ a { color: var(--accent); }
   </section>
 
   <section>
-    <h2>Run it on another grader</h2>
-    <p>Pointing the map at another grader or part means swapping two functions in <code>blindspot_map.py</code>: the one that scores an edited capture, and the one that says where the task allows changes. For this grader the second one reuses the check's own zone logic.</p>
-<pre>python3 tools/blindspot_map.py 400 4 blindspots.json
-python3 tools/build_blindspot_page.py blindspot_map.html blindspots.json</pre>
+    <h2>Use it to prove a change</h2>
+    <p>The map is part of a small audit that every change to the grader has to pass. It grades the same spots before and after the change and fails if the reference loses marks, a broken example scores higher, a harmless edit is newly flagged, or anything caught before is missed. Pointing it at another grader or part means swapping two functions: the one that scores an edited part and the one that says where the task allows changes.</p>
+<pre>python3 tools/blindspot_audit.py run audit/before
+python3 tools/blindspot_audit.py run audit/after --spots-from audit/before
+python3 tools/blindspot_audit.py compare audit/before audit/after</pre>
   </section>
 
   <footer id="foot">Hryhorii Markevych &middot; follow-up to the StoryGold CAD evaluation take-home &middot; <a href="https://github.com/Hrehoryjj/testcase_storygold" target="_blank" rel="noopener">github.com/Hrehoryjj/testcase_storygold</a></footer>
