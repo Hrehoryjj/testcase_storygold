@@ -70,6 +70,8 @@ a { color: var(--accent); }
 .now { margin: 0; font-size: .92rem; color: var(--fg); }
 .howto dl { display: grid; grid-template-columns: minmax(0, 11rem) minmax(0, 1fr); gap: 8px 16px; margin: 0; }
 .howto dt { font-weight: 600; }
+.howto p { margin: 0; color: var(--muted); }
+.howto .note { color: var(--fg); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; }
 .howto dd { margin: 0; color: var(--muted); }
 .howto h3 { font: 600 .74rem/1.2 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 8px 0 0; }
 @media (max-width: 520px) { .howto dl { grid-template-columns: minmax(0, 1fr); gap: 2px; } .howto dd { margin-bottom: 8px; } }
@@ -125,16 +127,21 @@ a { color: var(--accent); }
       <dt>Tight Zones (proposed)</dt><dd>The stronger version of the same check. Its skipped zones are much narrower, so far less of the housing is purple.</dd>
     </dl>
     <h3>View</h3>
+    <p>Each view paints the part with the result of one test. Four views are real edits nobody asked for, which the check should catch. Two are false alarm tests, and one gives context.</p>
     <dl>
       <dt>All four edits</dt><dd>At each spot, how many of the four real edits below are caught. Blue means all four, red means none.</dd>
       <dt>Boss 0.15 mm</dt><dd>A raised disc 8 mm across and 0.15 mm high, about the smallest step the check is meant to see. Blue caught, red missed.</dd>
       <dt>Boss 0.5 mm</dt><dd>The same disc, 0.5 mm high.</dd>
       <dt>Boss 3 mm</dt><dd>The same disc, 3 mm high: an extra anyone would notice at once.</dd>
       <dt>Through hole</dt><dd>A hole 8 mm across through the housing wall.</dd>
+      <dt>False alarms</dt><dd>A false alarm is the check flagging a part that did not really change. The two tests below change how the part is built or meshed but not its shape. A good check catches the real edits and leaves these alone, so here blue everywhere is the goal.</dd>
       <dt>False alarms: split line</dt><dd>The disc becomes its own face but the shape does not change, as an imprinted sketch does. It must not be flagged: blue means left alone, red means flagged by mistake.</dd>
       <dt>False alarms: re-mesh</dt><dd>The disc is meshed finer and its points move up to 0.05 mm, as with another mesh quality setting. It must not be flagged either.</dd>
       <dt>Context: reshaped surface</dt><dd>Grey where the reference keeps the original surface, orange where the reference rebuilt it, so the original part cannot serve as a template there.</dd>
-      <dt>Show spots</dt><dd>Marks the measured spots. Colour between spots is filled in from nearby spots that face the same way.</dd>
+      <dt>Show spots</dt><dd>Marks the spots where an edit was actually made and graded. The colour between spots is filled in from the nearest spots, so the dots show how much real data stands behind each patch of colour: a patch with several dots is solid, a single dot is one trial.</dd>
+    </dl>
+    <p class="note"><b>How dense the measurement is.</b> This map uses 408 spots spread evenly over the outer housing, about <span class="gapmm"></span> mm apart. Those outside the skipped zones are edited and graded (258 with the submitted grader, 326 with Tight Zones), and Show spots marks them. The spacing is set so that every 8 mm edit gets its own patch of surface and the whole run stays practical on one PC: each spot is graded once per edit, a few thousand grades in all. The number of spots is a setting. More spots give a denser grid and sharper edges between caught and missed areas; halving the spacing gives about four times as many spots and takes about four times as long.</p>
+    <dl hidden>
     </dl>
   </section>
 
@@ -225,6 +232,7 @@ const name = e => e === "hole" ? "through hole" : HARM.includes(e) ? `${e} (shou
 document.querySelector("#edits tbody").innerHTML = E.map(e =>
   `<tr><td>${name(e)}</td><td class="n">${S.per_edit[e]} / ${S.spots}</td><td class="n">${pct(S.per_edit[e], S.spots)}</td></tr>`).join("");
 document.getElementById("gap").textContent = S.gap_mm;
+document.querySelectorAll(".gapmm").forEach(el => el.textContent = Math.round(S.gap_mm));
 document.getElementById("grades").textContent = (S.spots * E.length).toLocaleString("en");
 const tight = grader === "tight";
 document.getElementById("kStrip").textContent = tight
