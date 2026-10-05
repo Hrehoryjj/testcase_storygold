@@ -6,7 +6,7 @@ This is the second part of the notes. [NOTES.md](NOTES.md) describes the
 grader; this part describes how its blind spots were measured and closed.
 The grader in `harness/` is unchanged by it; the improved check sits beside
 it in `harness_tight_zones/`. The originally submitted version is kept
-under the tag `submitted`.
+on the branch `submitted`.
 
 **Scope.** This is a method for finding and closing a grader's blind spots,
 shown on one criterion. The same approach applies to every criterion (see
