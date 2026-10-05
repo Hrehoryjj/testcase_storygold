@@ -4703,15 +4703,6 @@ def cli(argv=None):
     HC.cli(SPEC, argv)
 
 
-if __name__ == "__main__":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-    cli()
-
-
 # -- Tight Zones added on top: the checks of the current grader all stay ----
 # The criterion is graded both ways and the lower score stands, so this
 # version can only catch more than the current one, never less. The current
@@ -4744,3 +4735,12 @@ def _c5_both(self):
 
 
 Grader.c5_unrequested = _c5_both
+
+
+if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    cli()

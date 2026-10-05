@@ -59,8 +59,14 @@ is newly flagged, and nothing caught today is missed.
 - The top of the D-pad after the move is still weak: the reference rebuilt
   the seats there, so edits are judged by size only (7 spots catch none of
   the four edits).
-- Grading takes about twice as long, since both versions of the criterion
-  run.
+- The untouched seed and the shell widened without its controls each lose
+  0.018 on this criterion: one patch of about 23 mm² next to the left
+  bumper, seen only where the controls were not moved. Not moving them is
+  already charged elsewhere, so this counts it twice; the cause is not
+  traced yet.
+- Grading takes longer, since both versions of the criterion run: about
+  54 s instead of 22 s for the reference from its capture, and about
+  8 minutes for the example with 34 broken features.
 
 ## Run it
 

@@ -1,0 +1,51 @@
+<title>Blind-Spot Audit</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Saira+Semi+Condensed:wght@700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+:root { --bg:#f4f5f2; --panel:#fff; --fg:#1d2327; --muted:#5d666d;
+  --line:#dde1dd; --accent:#1f6f8b; --ok:#2a7f5e; --bad:#c4462f;
+  --display:"Saira Semi Condensed",system-ui,sans-serif;
+  --body:"Source Sans 3",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,monospace; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg:#12171a; --panel:#1a2125; --fg:#e6eaec; --muted:#9aa5ab;
+  --line:#2b3438; --accent:#5fb3cf; --ok:#5cc29a; --bad:#ec7a63;
+  color-scheme: dark } }
+:root[data-theme="dark"] { --bg:#12171a; --panel:#1a2125; --fg:#e6eaec;
+  --muted:#9aa5ab; --line:#2b3438; --accent:#5fb3cf; --ok:#5cc29a;
+  --bad:#ec7a63; color-scheme: dark }
+body { background:var(--bg); color:var(--fg); font:400 1rem/1.55 var(--body);
+  margin:0; }
+.wrap { max-width:960px; margin:0 auto; padding-inline:16px;
+  padding-block:28px 48px; display:grid; gap:24px; }
+h1 { font:700 2.2rem/1.1 var(--display); margin:0; text-wrap:balance; }
+h2 { font:700 1.3rem/1.2 var(--display); margin:0; }
+.eyebrow { font:600 .78rem/1 var(--mono); letter-spacing:.08em;
+  text-transform:uppercase; color:var(--accent); }
+.verdict { border-left:4px solid var(--ok); background:var(--panel);
+  padding:14px 16px; border-radius:4px; display:grid; gap:6px; }
+.verdict.bad { border-color:var(--bad); }
+.verdict b { font:700 1.1rem/1.2 var(--display); }
+section { display:grid; gap:10px; min-width:0; }
+.tbl { overflow-x:auto; }
+table { width:100%; border-collapse:collapse;
+  font-variant-numeric:tabular-nums; }
+th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
+th { font:600 .74rem/1.2 var(--mono); letter-spacing:.05em;
+  text-transform:uppercase; color:var(--muted); }
+td.n { font-family:var(--mono); text-align:right; white-space:nowrap; }
+.up { color:var(--ok); } .down { color:var(--bad); }
+ul { margin:0; padding-left:1.2em; display:grid; gap:4px; }
+p, li, td { overflow-wrap:anywhere; }
+p { margin:0; max-width:68ch; }
+.muted { color:var(--muted); }
+a { color:var(--accent); }
+</style><div class=wrap>
+<header><div class="eyebrow">Blind-Spot Audit</div>
+<h1>Before and after</h1></header>
+<div class="verdict"><b>All gates pass</b>
+<p class="muted">Gates: the reference scores full marks; no example scores higher than before; no harmless edit newly flagged; nothing caught before is missed or skipped now.</p></div>
+<section><h2>Map</h2><div class=tbl><table><tr><th>Measure</th><th style='text-align:right'>Before</th><th style='text-align:right'>After</th></tr><tr><td>Spots on the outer skin</td><td class="n">408</td><td class="n">408</td></tr><tr><td>Checked (outside the skipped zones)</td><td class="n">258</td><td class="n">326</td></tr><tr><td>Spots skipped near controls</td><td class="n">31%</td><td class="n">19%</td></tr><tr><td>Spots skipped in the widening strip</td><td class="n">5%</td><td class="n">1%</td></tr><tr><td>All real edits caught</td><td class="n">187 of 258</td><td class="n">218 of 326</td></tr><tr><td>boss 0.15 mm caught</td><td class="n">223 of 258</td><td class="n">258 of 326</td></tr><tr><td>boss 0.5 mm caught</td><td class="n">231 of 258</td><td class="n">290 of 326</td></tr><tr><td>boss 3 mm caught</td><td class="n">256 of 258</td><td class="n">315 of 326</td></tr><tr><td>hole caught</td><td class="n">244 of 258</td><td class="n">298 of 326</td></tr><tr><td>split line (false alarm if flagged)</td><td class="n">1 of 258</td><td class="n">1 of 326</td></tr><tr><td>re-mesh (false alarm if flagged)</td><td class="n">0 of 258</td><td class="n">0 of 326</td></tr></table></div><p><a href="blindspot_map.html#tight">Open the 3D map</a> &middot; <a href="blindspot_map.html">the earlier map</a></p></section>
+<section><h2>Shipped models, full grade</h2><p class=muted>Out of 8.0. The reference must keep full marks; the examples are broken on purpose, so a higher score means a weaker grader.</p><div class=tbl><table><tr><th>Model</th><th style='text-align:right'>Before</th><th style='text-align:right'>After</th></tr><tr><td>adversarial_feature_tree_with_errors</td><td class="n">2.78</td><td class="n" class="up">2.761</td></tr><tr><td>adversarial_missing_glyphs</td><td class="n">7.0</td><td class="n">7.0</td></tr><tr><td>adversarial_only_one_button_cluster_mirrored</td><td class="n">6.059</td><td class="n">6.059</td></tr><tr><td>adversarial_text_mirrored_incorrectly</td><td class="n">6.3</td><td class="n">6.3</td></tr><tr><td>adversarial_unrequested_change_elsewhere</td><td class="n">7.726</td><td class="n" class="up">7.712</td></tr><tr><td>adversarial_unwidened_shell_with_correct_clusters</td><td class="n">0.441</td><td class="n" class="up">0.433</td></tr><tr><td>adversarial_widened_15mm_clusters_at_original_spacing</td><td class="n">3.211</td><td class="n" class="up">3.193</td></tr><tr><td>adversarial_widened_by_30mm</td><td class="n">6.5</td><td class="n">6.5</td></tr><tr><td>input</td><td class="n">3.0</td><td class="n" class="up">2.982</td></tr><tr><td>solution</td><td class="n">8.0</td><td class="n">8.0</td></tr></table></div></section>
+<section><h2>Other changes</h2><ul><li>adversarial_feature_tree_with_errors scores 0.019 lower than before.</li><li>adversarial_unrequested_change_elsewhere scores 0.014 lower than before.</li><li>adversarial_unwidened_shell_with_correct_clusters scores 0.008 lower than before.</li><li>adversarial_widened_15mm_clusters_at_original_spacing scores 0.018 lower than before.</li><li>input scores 0.018 lower than before.</li><li>68 spots skipped before are checked now; 200 of 272 real edits there are caught.</li></ul></section>
+<section><h2>What if the zones were tighter</h2><p class=muted>Share of the reference's outer skin the check skips, by area (99,379 mm&sup2;). The first row is this grader; the others are geometry only, the reach of a change, not a measured result.</p><div class=tbl><table><tr><th>Zone rule</th><th style='text-align:right'>Skipped</th></tr><tr><td>As this grader works (measured)</td><td class=n>15%</td></tr><tr><td>A box around each control instead of each group, 8 mm margin</td><td class=n>30%</td></tr><tr><td>Pads compared with the mirrored original, so only each control&#x27;s own box and 1.5 mm around it</td><td class=n>12%</td></tr><tr><td>As above, and the middle compared with the original section drawn across it: only 1.5 mm at the two joins</td><td class=n>8%</td></tr></table></div></section>
+<p class=muted>Grader test_example/SolidWorks/1_playstation_controller/tests/task/harness_tight_zones/harness.py (sha256 03be1ebeaf82).</p></div>
