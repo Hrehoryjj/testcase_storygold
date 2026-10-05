@@ -1,0 +1,608 @@
+--- harness/harness.py
++++ harness_tight_zones/harness.py
+@@ -338,7 +338,24 @@
+     "skin_on_mm": 0.3,           # a sample this close to the moved seed skin
+     "skin_normal_dot": 0.9,      #   and facing the same way lies on it
+     "skin_face_frac": 0.7,       # share of a face that must lie on the skin
+-    "skin_margin_mm": 8.0,       # around the plane strip and every control
++    "skin_margin_mm": 8.0,       # the current rule: strip and control groups
++    # Tight Zones
++    "tz_control_margin_mm": 1.5,  # around each control body
++    "tz_role_margin_mm": {"sticks": 4.0, "bumpers": 4.0, "triggers": 4.0},
++    "tz_join_mm": 1.5,           # band at each join of a half and the middle
++    "tz_reg_slack_mm": 0.5,      # how far a half may sit off the task's move
++    "tz_mirror": True,           # compare swapped pads with the mirrored seed
++    "tz_pad_reach_mm": 12.0,     # pad box: the cluster's box and this much
++    "tz_pad_face_share": 0.9,    # a seed face this much inside it is a pad
++    "tz_pad_step_mm": 0.25,      # step a piece needs on a mirrored pad
++    "tz_pad_hole_min": True,     # intact-face hole size on mirrored pads
++    "tz_sweep": True,            # check the middle against the swept section
++    "tz_sweep_span_mm": 11.0,    # a face swept must run this far past the
++                                 # plane on both sides; a smaller one across
++                                 # the plane is a centred feature
++    "tz_seed_sym_gate": True,    # a one-sided patch where the seed itself is
++                                 # one-sided is the seed's, not an edit
++    "tz_asym_buffer_mm": 3.0,    # around seed skin that has no mirror image
+     "skin_piece_min_mm2": 5.0,   # a sliver below this is not a piece
+     "skin_step_mm": 0.1,         # a piece must sit this far off its sibling
+     "skin_perfect_mm2": 20.0,    # extra area below this is tessellation
+@@ -1650,6 +1667,11 @@
+ def _clusters(pts, link2):
+     """Groups of records whose points (record[0]) chain within sqrt(link2)
+     of each other."""
++    c = math.sqrt(link2) or 1.0
++    grid = {}
++    for i, r in enumerate(pts):
++        grid.setdefault(tuple(int(math.floor(v / c)) for v in r[0]),
++                        []).append(i)
+     seen, out = set(), []
+     for i in range(len(pts)):
+         if i in seen:
+@@ -1660,13 +1682,17 @@
+             j = stack.pop()
+             comp.append(pts[j])
+             pj = pts[j][0]
+-            for m in range(len(pts)):
+-                if m not in seen:
+-                    pm = pts[m][0]
+-                    if ((pj[0] - pm[0]) ** 2 + (pj[1] - pm[1]) ** 2
+-                            + (pj[2] - pm[2]) ** 2) <= link2:
+-                        seen.add(m)
+-                        stack.append(m)
++            k = tuple(int(math.floor(v / c)) for v in pj)
++            for a in (-1, 0, 1):
++                for b in (-1, 0, 1):
++                    for d in (-1, 0, 1):
++                        for m in grid.get((k[0] + a, k[1] + b, k[2] + d), ()):
++                            if m not in seen:
++                                pm = pts[m][0]
++                                if ((pj[0] - pm[0]) ** 2 + (pj[1] - pm[1]) ** 2
++                                        + (pj[2] - pm[2]) ** 2) <= link2:
++                                    seen.add(m)
++                                    stack.append(m)
+         out.append(comp)
+     return out
+ 
+@@ -1842,6 +1868,36 @@
+ 
+ 
+ _DENSE_CACHE = {}
++_ZONE_INDEX = {}
++_TZ_SEED_MESH = {}
++_ZONE_CELL = 10.0
++
++
++def _in_zones(p, zones):
++    """Whether p lies in any box of zones, through a grid of the boxes
++    (built once per zones list; a grade asks this a few hundred thousand
++    times)."""
++    hit = _ZONE_INDEX.get(id(zones))
++    if hit is None or hit[0] is not zones:
++        grid = {}
++        f = math.floor
++        for z in zones:
++            lo = [int(f(z[i] / _ZONE_CELL)) for i in range(3)]
++            hi = [int(f(z[i + 3] / _ZONE_CELL)) for i in range(3)]
++            for a in range(lo[0], hi[0] + 1):
++                for b in range(lo[1], hi[1] + 1):
++                    for c in range(lo[2], hi[2] + 1):
++                        grid.setdefault((a, b, c), []).append(z)
++        if len(_ZONE_INDEX) > 16:
++            _ZONE_INDEX.clear()
++        hit = _ZONE_INDEX[id(zones)] = (zones, grid)
++    k = (int(math.floor(p[0] / _ZONE_CELL)), int(math.floor(p[1] / _ZONE_CELL)),
++         int(math.floor(p[2] / _ZONE_CELL)))
++    for z in hit[1].get(k, ()):
++        if z[0] <= p[0] <= z[3] and z[1] <= p[1] <= z[4] \
++                and z[2] <= p[2] <= z[5]:
++            return True
++    return False
+ _GAP_CACHE = {}
+ 
+ 
+@@ -1865,6 +1921,8 @@
+     return out
+ 
+ 
++
++
+ class Grader:
+     def __init__(self, baseline, measured):
+         self.bl = baseline
+@@ -3135,37 +3193,127 @@
+                           "this criterion's."}
+ 
+     # -- c5 ------------------------------------------------------------
++    TZ_MIRROR_ROLES = ("dpad", "face_buttons")
++
++    def _tz_pad(self, q):
++        """Whether a seed point lies on a pad that moves to the other side
++        (the clusters the task swaps)."""
++        if not TOL["tz_mirror"]:
++            return False
++        boxes = getattr(self, "_tz_pad_boxes", None)
++        if boxes is None:
++            r = TOL["tz_pad_reach_mm"]
++            boxes = []
++            for role in self.TZ_MIRROR_ROLES:
++                bb = (self.bl.get("role_bbox_m") or {}).get(role)
++                if bb:
++                    bb = [v * MM for v in bb]
++                    boxes.append([bb[i] - r for i in range(3)]
++                                 + [bb[i + 3] + r for i in range(3)])
++            self._tz_pad_boxes = boxes
++        return any(all(b[i] <= q[i] <= b[i + 3] for i in range(3))
++                   for b in boxes)
++
++    def _tz_pad_tag(self, SS):
++        """Tag "M" on every sample of a seed face that lies on a swapped pad
++        (at least tz_pad_face_share of its area inside a pad box): those
++        faces are compared mirrored, all others straight, a whole face at
++        a time so a big face that only touches a pad keeps its own side."""
++        if not TOL["tz_mirror"]:
++            return SS
++        out = []
++        for ps in SS:
++            if ps and len(ps[0]) == 7:
++                a = sum(q[3] for q in ps)
++                b = sum(q[3] for q in ps if self._tz_pad(q))
++                if a > 0 and b >= TOL["tz_pad_face_share"] * a:
++                    out.append([tuple(q) + ("M",) for q in ps])
++                    continue
++            out.append(ps)
++        return out
++
++    def _tz_mirrored(self, q):
++        return len(q) > 7 and q[7] == "M"
++
++    def _tz_map(self, q, P):
++        """Where a seed sample belongs on the candidate before the half's
++        move: (x, normal x sign). Pads of swapped clusters are mirrored
++        across the plane, everything else stays."""
++        if self._tz_mirrored(q):
++            return 2.0 * P - q[0], -1.0
++        return q[0], 1.0
++
++    def _tz_moves(self, q, P, moves):
++        """Each place a seed sample is expected on the candidate, with its
++        normal and side: [(sg, [(p, n) per move])]. Swept middle samples
++        (tagged "S") are not moved."""
++        n = (q[4], q[5], q[6])
++        if len(q) > 7 and q[7] == "S":
++            sg = 1 if q[0] > P else -1
++            return [(sg, [((q[0], q[1], q[2]), n)])]
++        x, f = self._tz_map(q, P)
++        n = (f * n[0], n[1], n[2])
++        d = x - P
++        sides = (1, -1) if abs(d) < TOL["halves_deadband_mm"] \
++            else ((1,) if d > 0 else (-1,))
++        stay = [((x, q[1], q[2]), n)] if len(q) > 7 and q[7] == "C" else []
++        return [(sg, [((x + sg * m, q[1], q[2]), n) for m in moves[sg]]
++                 + stay) for sg in sides]
++
+     def _skin_zones(self, P, half):
+-        """Boxes around every control, at its seed position moved by the
+-        task rule and at its candidate position, widened by skin_margin_mm."""
+-        m = TOL["skin_margin_mm"]
+-        zones = []
+-        for src, moved in ((self.ms, False), (self.bl, True)):
+-            for role, b in (src.get("role_bbox_m") or {}).items():
+-                if role == "housing" or not b:
+-                    continue
+-                bb = [v * MM for v in b]
+-                if moved:
+-                    cx = (bb[0] + bb[3]) / 2
+-                    if abs(cx - P) < TOL["halves_deadband_mm"]:
+-                        bb[0] -= half
+-                        bb[3] += half
+-                    else:
+-                        sg = 1 if cx > P else -1
+-                        bb[0] += sg * half
+-                        bb[3] += sg * half
+-                zones.append([bb[i] - m for i in range(3)]
+-                             + [bb[i + 3] + m for i in range(3)])
++        """Tight Zones: a box around each control body, at its candidate
++        position and at its seed position moved the way its pad moves
++        (mirrored for the swapped clusters), widened by tz_control_margin_mm."""
++        m0 = TOL["tz_control_margin_mm"]
++        dx = self.plane_shift_m * MM
++        zones = list(self._tz_centred_boxes(P, half))
++        for src, seed in ((self.ms, False), (self.bl, True)):
++            meshes = src.get("control_meshes") or {}
++            role_of = {b: r for r, bs in (src.get("roles") or {}).items()
++                       for b in bs}
++            for key, rec in meshes.items():
++                if role_of.get(key) == "housing":
++                    continue
++                tris = mesh_tris3_mm(rec)
++                if not tris:
++                    continue
++                m = TOL["tz_role_margin_mm"].get(role_of.get(key), m0)
++                lo = [min(q[i] for t in tris for q in t) for i in range(3)]
++                hi = [max(q[i] for t in tris for q in t) for i in range(3)]
++                if not seed:
++                    lo[0] += dx
++                    hi[0] += dx
++                    zones.append([v - m for v in lo] + [v + m for v in hi])
++                    continue
++                if TOL["tz_mirror"] and \
++                        role_of.get(key) in self.TZ_MIRROR_ROLES:
++                    lo[0], hi[0] = 2.0 * P - hi[0], 2.0 * P - lo[0]
++                cx = (lo[0] + hi[0]) / 2
++                if abs(cx - P) < TOL["halves_deadband_mm"]:
++                    lo[0] -= half
++                    hi[0] += half
++                else:
++                    sg = 1 if cx > P else -1
++                    lo[0] += sg * half
++                    hi[0] += sg * half
++                zones.append([v - m for v in lo] + [v + m for v in hi])
+         return zones
+ 
+     @staticmethod
+     def _skin_exempt(p, P, half, zones):
+-        """True where an edit was asked for: the widening strip about the
+-        plane, or near a control."""
+-        if abs(p[0] - P) <= half + TOL["skin_margin_mm"]:
++        """True where an edit was asked for: the joins where each half meets
++        the widened middle (the middle itself is checked against the seed's
++        section swept across it), or near a control."""
++        d = abs(p[0] - P)
++        if not TOL["tz_sweep"]:
++            if d <= half + TOL["skin_margin_mm"]:
++                return True
++            return any(all(z[i] <= p[i] <= z[i + 3] for i in range(3))
++                       for z in zones)
++        j = TOL["tz_join_mm"] + TOL["tz_reg_slack_mm"]
++        if half - j <= d <= half + j:
+             return True
+-        return any(all(z[i] <= p[i] <= z[i + 3] for i in range(3))
+-                   for z in zones)
++        return _in_zones(p, zones)
+ 
+     # -- c5.3: skin splits ----------------------------------------------
+     def _skin_splits(self):
+@@ -3200,15 +3348,18 @@
+         dx = self.plane_shift_m * MM
+         cell = 4.0
+         grid = {}
++        n0 = len(self.bl["housing_faces"])
+         for fi, ps in enumerate(SS):
+             for q in ps:
+                 if len(q) < 7:
+                     continue
+-                d = q[0] - P
+-                sides = (1, -1) if abs(d) < TOL["halves_deadband_mm"] \
+-                    else ((1,) if d > 0 else (-1,))
+-                for sg in sides:
+-                    s_ = (q[0] + sg * half, q[1], q[2], q[4], q[5], q[6], fi)
++                pad = self._tz_mirrored(q)
++                for sg, places in self._tz_moves(
++                        q, P, {1: (half,), -1: (half,)}):
++                    pp, nn = places[0]
++                    # a swept sample stands for the seed face it came from
++                    s_ = (pp[0], pp[1], pp[2], nn[0], nn[1], nn[2],
++                          fi if fi < n0 else fi - n0, pad)
+                     key = tuple(int(math.floor(s_[i] / cell))
+                                 for i in range(3))
+                     grid.setdefault(key, []).append(s_)
+@@ -3253,7 +3404,7 @@
+                 if abs(off) > TOL["skin_on_mm"]:
+                     continue
+                 on += q[3]
+-                key = (s_[6], 1 if p[0] > P else -1)
++                key = (s_[6], 1 if p[0] > P else -1, s_[7])
+                 votes[key] = votes.get(key, 0.0) + q[3]
+                 offs[key] = offs.get(key, 0.0) + q[3] * off
+             if tot <= 0 or on < TOL["skin_face_frac"] * tot or not votes:
+@@ -3265,13 +3416,14 @@
+                         (a, offs[key] / a, [round(v, 1) for v in f["c"]]))
+ 
+         extra, pieces = 0.0, []
+-        for (fi, side), lst in cover.items():
++        for (fi, side, pad), lst in cover.items():
+             if len(lst) < 2:
+                 continue
+             lst.sort(key=lambda r: -r[0])
+             base = lst[0][1]
+             for a, off, c in lst[1:]:
+-                if abs(off - base) < TOL["skin_step_mm"]:
++                if abs(off - base) < (TOL["tz_pad_step_mm"] if pad
++                                      else TOL["skin_step_mm"]):
+                     continue
+                 extra += a
+                 pieces.append({"seed_face": fi, "side": side,
+@@ -3286,6 +3438,80 @@
+                               "(tessellation missing): nothing was checked")
+         return extra, out
+ 
++    def _tz_swept(self, SS):
++        """The seed's section at the plane swept across the widened middle:
++        a correct widening stretches the part there, so the surface on the
++        seed's section line runs straight across the added width. One
++        pseudo face per seed face, samples tagged "S" (not moved). Only
++        surface that runs along X (normal mostly across it) is swept."""
++        if not TOL["tz_sweep"]:
++            return []
++        P = self.P * MM
++        half = self._actual_half_m() * MM
++        j = TOL["tz_join_mm"] + TOL["tz_reg_slack_mm"]
++        lim = half - j
++        if lim <= 0:
++            return []
++        xs, x = [], -lim
++        while x <= lim + 1e-9:
++            xs.append(P + x)
++            x += SKIN_CELL_MM
++        out = []
++        span = TOL["tz_sweep_span_mm"]
++        for ps in SS:
++            if not ps or min(q[0] for q in ps) > P - span \
++                    or max(q[0] for q in ps) < P + span:
++                out.append([])
++                continue
++            band = [q for q in ps if abs(q[0] - P) <= SKIN_CELL_MM / 2
++                    and abs(q[4]) < 0.3]
++            out.append([(x, q[1], q[2], q[3], q[4], q[5], q[6], "S")
++                        for q in band for x in xs])
++        return out
++
++    def _tz_centred_boxes(self, P, half):
++        """Box around each centred seed feature (see _tz_centred), as wide
++        as the feature stretched or kept centred, plus the asym buffer: the
++        skin that frames it is kept or rebuilt with it."""
++        if not TOL["tz_sweep"]:
++            return []
++        sf = self.bl.get("housing_faces") or []
++        span = TOL["tz_sweep_span_mm"]
++        m = TOL["tz_asym_buffer_mm"]
++        boxes = []
++        for f in sf:
++            ps = [q for q in (f.get("p") or []) if len(q) >= 3]
++            if not ps:
++                continue
++            xs = [q[0] for q in ps]
++            if not (min(xs) < P < max(xs)
++                    and max(abs(x - P) for x in xs) < span):
++                continue
++            lo = [min(q[i] for q in ps) for i in range(3)]
++            hi = [max(q[i] for q in ps) for i in range(3)]
++            lo[0] -= half
++            hi[0] += half
++            boxes.append([v - m for v in lo] + [v + m for v in hi])
++        return boxes
++
++    def _tz_centred(self, SS):
++        """Seed faces that sit across the plane and end within
++        tz_sweep_span_mm of it on both sides (a small centred feature): a
++        correct widening may keep them centred instead of splitting them,
++        so their samples are tagged "C" and may also stay where they are."""
++        if not TOL["tz_sweep"]:
++            return SS
++        P = self.P * MM
++        span = TOL["tz_sweep_span_mm"]
++        out = []
++        for ps in SS:
++            if ps and min(q[0] for q in ps) < P < max(q[0] for q in ps) \
++                    and max(abs(q[0] - P) for q in ps) < span:
++                out.append([tuple(q[:7]) + ("C",) for q in ps])
++            else:
++                out.append(ps)
++        return out
++
+     def _skin_samples(self):
+         """Per housing face, the skin samples both skin checks read, for the
+         seed and the candidate, at one shared resolution: (seed, candidate,
+@@ -3303,8 +3529,11 @@
+         if not sf or not cf:
+             return None
+         if all("mt" in f for f in sf) and all("mt" in f for f in cf):
+-            return (_dense_samples(sf), _dense_samples(cf), SKIN_CELL_MM,
+-                    "mesh resampled at %.1f mm" % SKIN_CELL_MM)
++            SS = _dense_samples(sf)
++            return (self._tz_pad_tag(self._tz_centred(SS))
++                    + self._tz_swept(SS),
++                    _dense_samples(cf),
++                    SKIN_CELL_MM, "mesh resampled at %.1f mm" % SKIN_CELL_MM)
+         clean = lambda fs: [[q for q in (f.get("p") or []) if len(q) >= 7]
+                             for f in fs]
+         return clean(sf), clean(cf), SAMPLE_CELL_M * MM, \
+@@ -3387,7 +3616,8 @@
+         reg = {}
+         for sg in (-1, 1):
+             sub = [q for _, q in samples
+-                   if (q[0] - P) * sg > 0
++                   if len(q) < 8
++                   and (q[0] - P) * sg > 0
+                    and abs(q[0] - P) > strip + TOL["skin_margin_mm"]]
+             sub = sub[::max(1, len(sub) // TOL["skin_reg_samples"])]
+             lo = min(moves) - TOL["skin_reg_pad_mm"]
+@@ -3415,23 +3645,27 @@
+         if not source.startswith("captured"):
+             exact = self._skin_mesh()
+         faces = {}
++        moves = {1: (half, reg[1]), -1: (half, reg[-1])}
++        zgone = {}
+         for fi, q in samples:
+-            d = q[0] - P
+-            sides = (1, -1) if abs(d) < TOL["halves_deadband_mm"] \
+-                else ((1,) if d > 0 else (-1,))
+-            for sg in sides:
++            for sg, places in self._tz_moves(q, P, moves):
+                 ok = exempt = False
+-                for m in (half, reg[sg]):
+-                    p = (q[0] + sg * m, q[1], q[2])
++                for p, nn in places:
+                     if self._skin_exempt(p, P, strip, zones):
+                         exempt = True
+                         break
+-                    if (exact.on(p, q[4:7], ndot) if exact is not None
+-                            else on_skin(p, q[4:7])):
++                    if (exact.on(p, nn, ndot) if exact is not None
++                            else on_skin(p, nn)):
+                         ok = True
+                         break
+                 if not exempt:
+                     faces.setdefault((fi, sg), []).append((p, q[3], ok))
++                elif TOL["tz_sweep"] and exact is not None and not any(
++                        exact.on(pp, nn, ndot) for pp, nn in places):
++                    # skin gone inside a zone: never charged, but a patch
++                    # that runs on from it is judged with it (a rebuild cut
++                    # in pieces by the zones is still one rebuild)
++                    zgone.setdefault(sg, []).append((p, q[3], fi, True, 1))
+ 
+         # captured 3 mm samples lump a long triangle's whole area onto one
+         # point, so each counts one cell at most; mesh samples are exact
+@@ -3457,22 +3691,36 @@
+                 remodelled += tot
+                 rebuilt.append((fi, sg))
+             pools.setdefault(sg, []).extend(
+-                (p, a, fi, rem) for p, a, ok in lst if not ok)
++                (p, a, fi, rem, 0) for p, a, ok in lst if not ok)
+         self._rebuilt = {"faces": rebuilt, "reg": reg}
++        for sg, zg in zgone.items():
++            pools.setdefault(sg, []).extend(zg)
++        # a mirrored pad is compared with the other pad of the original, so
++        # a small patch on it is an edit even where the pad was rebuilt
++        mfaces = {fi for fi, ps in enumerate(SS)
++                  if ps and self._tz_mirrored(ps[0])}
+         for sg, gone in pools.items():
+             for comp in _clusters(gone, link2):
+-                a = sum(min(c_[1], cell_a) for c_ in comp)
+-                a_rem = sum(min(c_[1], cell_a) for c_ in comp if c_[3])
+-                if a_rem <= 0.0:
++                if all(c_[4] for c_ in comp):
++                    continue
++                a = sum(min(c_[1], cell_a) for c_ in comp if not c_[4])
++                a_rem = sum(min(c_[1], cell_a) for c_ in comp
++                            if c_[3] and not c_[4])
++                a_z = sum(min(c_[1], cell_a) for c_ in comp if c_[4])
++                # zone skin only decides whether the patch is a rebuild;
++                # a patch on intact faces keeps the intact-face threshold
++                if a_rem + a_z > TOL["skin_rebuilt_max_mm2"]:
++                    a -= a_rem
+                     if a < TOL["skin_hole_min_mm2"]:
+                         continue
+-                elif a_rem <= TOL["skin_rebuilt_max_mm2"]:
+-                    if a < TOL["skin_rebuilt_min_mm2"]:
+-                        continue
+-                else:
+-                    a -= a_rem
++                elif a_rem <= 0.0:
+                     if a < TOL["skin_hole_min_mm2"]:
+                         continue
++                elif a < (TOL["skin_hole_min_mm2"]
++                           if TOL["tz_pad_hole_min"] and all(
++                               c_[2] in mfaces for c_ in comp if c_[3])
++                           else TOL["skin_rebuilt_min_mm2"]):
++                    continue
+                 extra += a
+                 holes.append({"seed_face": comp[0][2], "side": sg,
+                               "area_mm2": round(a, 1), "cells": len(comp),
+@@ -3562,6 +3810,58 @@
+                     continue
+                 pts.append((p, q[3], (-q[4], q[5], q[6])))
+ 
++        seed_sm = None
++        if TOL["tz_seed_sym_gate"]:
++            sf = self.bl["housing_faces"]
++            hit = _TZ_SEED_MESH.get(id(sf))
++            if hit is None or hit[0] is not sf:
++                _TZ_SEED_MESH.clear()
++                hit = _TZ_SEED_MESH[id(sf)] = (sf, SkinMesh(sf, 0.0, 0.5))
++            seed_sm = hit[1]
++
++        asym = {}
++        if seed_sm is not None:
++            bc = TOL["tz_asym_buffer_mm"]
++            for ps in SS:
++                for q in ps:
++                    if len(q) > 7 and q[7] == "S":
++                        continue
++                    if seed_sm.on((2.0 * P - q[0], q[1], q[2]),
++                                  (-q[4], q[5], q[6]), ndot):
++                        continue
++                    sg = 1 if q[0] > P else -1
++                    for mv in sorted({half, rb["reg"][sg]}):
++                        x = q[0] + sg * mv
++                        for xx in (x, 2.0 * P - x):
++                            k = (int(math.floor(xx / bc)),
++                                 int(math.floor(q[1] / bc)),
++                                 int(math.floor(q[2] / bc)))
++                            asym.setdefault(k, []).append((xx, q[1], q[2]))
++
++        def near_asym(p):
++            bc = TOL["tz_asym_buffer_mm"]
++            k0 = [int(math.floor(p[i] / bc)) for i in range(3)]
++            for a in (-1, 0, 1):
++                for b in (-1, 0, 1):
++                    for c in (-1, 0, 1):
++                        for r in asym.get((k0[0] + a, k0[1] + b, k0[2] + c),
++                                          ()):
++                            if sum((r[i] - p[i]) ** 2 for i in range(3)) \
++                                    <= bc * bc:
++                                return True
++            return False
++
++        def seed_one_sided(p, n):
++            """The seed at p moved back is itself without a mirror image."""
++            sg = 1 if p[0] > P else -1
++            for mv in sorted({half, rb["reg"][sg]}):
++                s0 = (p[0] - sg * mv, p[1], p[2])
++                nn = (-n[0], n[1], n[2])
++                if seed_sm.on(s0, nn, ndot):
++                    return not seed_sm.on((2.0 * P - s0[0], s0[1], s0[2]),
++                                          n, ndot)
++            return False
++
+         def lonely(pc, sub):
+             out = []
+             for p, a, n in sub:
+@@ -3569,6 +3869,9 @@
+                 if self._skin_exempt(m, P, strip, zones):
+                     continue
+                 if not sm.on(m, n, ndot):
++                    if seed_sm is not None and (near_asym(p)
++                                                or seed_one_sided(p, n)):
++                        continue
+                     out.append((p, a))
+             return out
+ 
+@@ -4407,3 +4710,37 @@
+     except Exception:
+         pass
+     cli()
++
++
++# -- Tight Zones added on top: the checks of the current grader all stay ----
++# The criterion is graded both ways and the lower score stands, so this
++# version can only catch more than the current one, never less. The current
++# grader is read from ../harness/harness.py.
++def _load_current():
++    import importlib.util
++    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
++                        os.pardir, "harness", "harness.py")
++    spec = importlib.util.spec_from_file_location("_harness_current", path)
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    return mod
++
++
++_CURRENT = _load_current()
++_tz_c5 = Grader.c5_unrequested
++
++
++def _c5_both(self):
++    tz = _tz_c5(self)
++    cur = _CURRENT.Grader(self.bl, self.ms).c5_unrequested()
++    if cur["score"] < tz["score"]:
++        out = dict(cur)
++        out["detail"] = dict(cur.get("detail") or {}, tight_zones=tz.get(
++            "detail"), decided_by="current checks")
++        return out
++    out = dict(tz)
++    out["detail"] = dict(tz.get("detail") or {}, decided_by="tight zones")
++    return out
++
++
++Grader.c5_unrequested = _c5_both

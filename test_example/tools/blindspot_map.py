@@ -186,23 +186,28 @@ def disc_edit(cap, kind, h, r, c):
     return cap
 
 
-def exempt_test(ref):
+def exempt_test(ref, mod=None):
     """The check's own exemption, in the reference's frame: 'strip' for the
     widening strip the task changes, 'controls' for the margins the check
     leaves around the controls, None where the check looks. Like the skin
     checks it includes the control zones at each half's registered shift,
     and a point is exempt when either move (the task's half width or the
     registered shift) lands it in a zone. Grading the reference once gives
-    those shifts."""
-    g = H.Grader(BASELINE, ref)
+    those shifts. A grader that keeps the current checks next to its own
+    (_CURRENT) skips only what both skip."""
+    M = mod or H
+    g = M.Grader(BASELINE, ref)
     g.c5_unrequested()
-    P, dx = g.P * H.MM, g.plane_shift_m * H.MM
-    half = g._actual_half_m() * H.MM
+    P, dx = g.P * M.MM, g.plane_shift_m * M.MM
+    half = g._actual_half_m() * M.MM
     strip = max(half, (g._shell_delta_mm() or 0.0) / 2)
     reg = g._rebuilt["reg"]
     zones = g._skin_zones(P, half)
     for v in sorted(set(reg.values())):
         zones = zones + g._skin_zones(P, v)
+    tz = M.TOL.get("tz_sweep")
+    other = exempt_test(ref, M._CURRENT) \
+        if mod is None and hasattr(M, "_CURRENT") else None
 
     def kind(q):
         p = (q[0] + dx, q[1], q[2])
@@ -212,7 +217,14 @@ def exempt_test(ref):
         if not any(g._skin_exempt(x, P, strip, zones)
                    for x in (p, alt, alt2)):
             return None
-        if abs(p[0] - P) <= strip + H.TOL["skin_margin_mm"]:
+        if other is not None and other(q) is None:
+            return None
+        d = abs(p[0] - P)
+        if tz:
+            j = M.TOL["tz_join_mm"] + M.TOL["tz_reg_slack_mm"]
+            if strip - j <= d <= strip + j:
+                return "strip"
+        elif d <= strip + M.TOL["skin_margin_mm"]:
             return "strip"
         return "controls"
     return kind

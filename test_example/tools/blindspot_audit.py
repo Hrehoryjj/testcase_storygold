@@ -177,8 +177,10 @@ def zone_tests(ref):
             return True
         return in_boxes(p, own_boxes, EDGE_MM)
     return {
-        "now": ("As the grader works now: a box around each group of "
-                "controls and the strip, 8 mm margin", lambda q: bool(now(q))),
+        "now": (("As this grader works (measured)" if H.TOL.get("tz_sweep")
+                 else "As the grader works now: a box around each group of "
+                 "controls and the strip, 8 mm margin"),
+                lambda q: bool(now(q))),
         "per_control": ("A box around each control instead of each group, "
                         "8 mm margin", per_control),
         "tight": (f"Pads compared with the mirrored original, so only each "
@@ -263,7 +265,7 @@ def verdict(before, after):
             fails.append(f"{name} scores {d:+.3f} higher than before: the "
                          "grader got weaker on it.")
         elif d < -1e-3:
-            notes.append(f"{name} scores {d:+.3f} lower than before.")
+            notes.append(f"{name} scores {-d:.3f} lower than before.")
     rb = {tuple(s["p"]): s["un"] for s in before["results"]["spots"]}
     harm = after["results"]["harmless"]
     fresh = []
@@ -333,7 +335,8 @@ th { font:600 .74rem/1.2 var(--mono); letter-spacing:.05em;
 td.n { font-family:var(--mono); text-align:right; white-space:nowrap; }
 .up { color:var(--ok); } .down { color:var(--bad); }
 ul { margin:0; padding-left:1.2em; display:grid; gap:4px; }
-p { margin:0; max-width:68ch; overflow-wrap:anywhere; }
+p, li, td { overflow-wrap:anywhere; }
+p { margin:0; max-width:68ch; }
 .muted { color:var(--muted); }
 a { color:var(--accent); }
 """
@@ -436,9 +439,9 @@ def report(after, before=None):
         parts.append(
             "<section><h2>What if the zones were tighter</h2>"
             "<p class=muted>Share of the reference's outer skin the check "
-            f"skips, by area ({z['outer_area_mm2']:,} mm&sup2;). Geometry "
-            "only: the grader was not changed, so this is the reach of a "
-            "change, not a measured result.</p><div class=tbl><table>"
+            f"skips, by area ({z['outer_area_mm2']:,} mm&sup2;). The first "
+            "row is this grader; the others are geometry only, the reach of "
+            "a change, not a measured result.</p><div class=tbl><table>"
             "<tr><th>Zone rule</th><th style='text-align:right'>Skipped"
             f"</th></tr>{zr}</table></div></section>")
     parts.append(f'<p class=muted>Grader {esc(g["harness"])} '
@@ -459,8 +462,11 @@ def cmd_run(args):
         spots_from = args[args.index("--spots-from") + 1]
     imports = []
     if "--import" in args:
-        imports = [a for a in args[args.index("--import") + 1:]
-                   if not a.startswith("--")]
+        imports = []
+        for a in args[args.index("--import") + 1:]:
+            if a.startswith("--"):      # the next option ends the list
+                break
+            imports.append(a)
     n = QUICK if "--quick" in args else FULL
 
     gpath = out / "gates.json"

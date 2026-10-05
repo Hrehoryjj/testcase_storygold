@@ -54,6 +54,17 @@ would skip with tighter zones around the controls and the widening strip.
 That part is geometry only. It shows how far a change could reach, not
 what it achieves, which only an audited change can show.
 
+## A change it proved
+
+`SolidWorks/1_playstation_controller/tests/task/harness_tight_zones/` is a
+proposed change audited this way: tighter zones around the controls, the
+button pads compared with the original pad from the other side, and the
+widened middle checked. The skipped share of the outer skin drops from 38%
+to 15% with every gate passing. Its README has the numbers.
+
+Results made elsewhere can be turned into a run without grading again:
+`run OUTDIR --import RESULTS.json ...` (the shipped models are still graded).
+
 ## Reading the numbers
 
 Each spot is one deterministic trial, so read patches on the map, not
