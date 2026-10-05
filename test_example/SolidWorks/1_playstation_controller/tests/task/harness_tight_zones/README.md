@@ -1,7 +1,7 @@
 # Tight Zones
 
-An improved version of the "no unrequested changes" check. The submitted
-grader in `../harness/` is not touched.
+An improved version of the "no unrequested changes" check. The main grader
+in `../harness/` is not changed by it.
 
 **The problem.** The check must ignore the areas the task changes: around
 the buttons and the strip where the controller is widened. It ignored them
@@ -16,11 +16,11 @@ with wide boxes, so about 38% of the outer surface was never checked.
 - the widened middle is compared with the original cross-section.
 
 The old check still runs and the lower score counts, so this version can
-catch more than the submitted one, never less.
+catch more than the main grader, never less.
 
 **The result**, measured on the same 408 test points:
 
-| | Submitted | Tight Zones |
+| | Main grader | Tight Zones |
 |---|---:|---:|
 | Outer surface not checked | 38% | **15%** |
 | Points checked | 258 | **326** |
@@ -31,13 +31,13 @@ catch more than the submitted one, never less.
 
 The correct solution keeps 8.0 (also in a live SolidWorks run), and no
 shipped example scores higher. `tight_zones.diff` shows every change
-against the submitted grader, and
-[NOTES_UPDATE.md](../../../../../../NOTES_UPDATE.md) explains the approach
+against the main grader, and
+[NOTES_GRADER_AUDIT.md](../../../../../../NOTES_GRADER_AUDIT.md) explains the approach
 and the next steps.
 
 ## Run it
 
-Exactly like the submitted grader, from `SolidWorks/1_playstation_controller`:
+Exactly like the main grader, from `SolidWorks/1_playstation_controller`:
 
 ```bat
 python tests\task\harness_tight_zones\harness.py solution\solution.SLDPRT

@@ -1,9 +1,12 @@
 # Finding and closing the grader's blind spots
 
-**Live 3D map:** https://claude.ai/artifact/RWEdixdQpN5UHgjzMpNGs8 (switch between the submitted and the improved check)
+**Live 3D map:** https://claude.ai/artifact/RWEdixdQpN5UHgjzMpNGs8 (switch between the main grader and the improved check)
 
-The version I submitted is unchanged on `main`. Everything here is an
-addition on this branch.
+This is the second part of the notes. [NOTES.md](NOTES.md) describes the
+grader; this part describes how its blind spots were measured and closed.
+The grader in `harness/` is unchanged by it; the improved check sits beside
+it in `harness_tight_zones/`. The originally submitted version is kept
+under the tag `submitted`.
 
 **Scope.** This is a method for finding and closing a grader's blind spots,
 shown on one criterion. The same approach applies to every criterion (see
@@ -51,13 +54,13 @@ checked at all**, whatever the size of an edit there.
 ## Result
 
 <table><tr>
-<td width="50%"><img src="test_example/SolidWorks/1_playstation_controller/evidence/blindspot/map_submitted_grader.png" alt="Map with the submitted check"><br>Submitted check. Purple and beige: not checked.</td>
+<td width="50%"><img src="test_example/SolidWorks/1_playstation_controller/evidence/blindspot/map_submitted_grader.png" alt="Map with the main grader"><br>Main grader. Purple and beige: not checked.</td>
 <td width="50%"><img src="test_example/SolidWorks/1_playstation_controller/evidence/blindspot/map_tight_zones.png" alt="Map with Tight Zones"><br>Tight Zones. Far less purple.</td>
 </tr></table>
 
 Blue means test edits are caught, red means they are missed.
 
-| Same 408 points | Submitted | Tight Zones |
+| Same 408 points | Main grader | Tight Zones |
 |---|---:|---:|
 | Outer surface not checked | 38% | **15%** |
 | Points checked | 258 | **326** |
@@ -112,7 +115,7 @@ proven end to end rather than several partly checked ones.
 
 | Where (under `test_example/`) | What |
 |---|---|
-| `SolidWorks/1_playstation_controller/tests/task/harness_tight_zones/` | The improved grader, used exactly like the submitted one |
+| `SolidWorks/1_playstation_controller/tests/task/harness_tight_zones/` | The improved grader, used exactly like the main one |
 | `SolidWorks/1_playstation_controller/evidence/blindspot/` | The 3D map (open in a browser), the before and after report, pictures |
 | `SolidWorks/1_playstation_controller/evidence/envelopes_tight_zones/` | Scores of the 10 shipped models |
 | `tools/blindspot_map.py`, `tools/blindspot_audit.py`, `tools/BLINDSPOT_AUDIT.md` | The map, the audit and how to run them |

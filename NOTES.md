@@ -1,6 +1,6 @@
 # PS3 controller grading harness: what changed and why
 
-> After submission I built a tool that measures what this grader sees and used it to make one of its checks stronger, beside the grader described here, which is unchanged. See [NOTES_UPDATE.md](NOTES_UPDATE.md).
+> Part two, [NOTES_GRADER_AUDIT.md](NOTES_GRADER_AUDIT.md), shows how this grader's blind spots were measured and how one of its checks was made stronger.
 
 Task: `test_example/SolidWorks/1_playstation_controller`. Harness: `tests/task/harness/harness.py`.
 
