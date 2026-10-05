@@ -45,13 +45,13 @@ checked at all**, whatever the size of an edit there.
    version can only catch more, never less. This is Tight Zones.
 3. **Proved it.** A before and after audit on the same 408 points with
    rules fixed in advance: the correct solution keeps full marks, no wrong
-   model scores higher, no harmless edit is flagged, and nothing caught
+   model scores higher, no harmless edit is newly flagged, and nothing caught
    before is missed now. All rules pass.
 
 ## Result
 
 <table><tr>
-<td width="50%"><img src="test_example/SolidWorks/1_playstation_controller/evidence/blindspot/map_submitted_grader.png" alt="Map with the submitted check"><br>Submitted check. Purple: not checked.</td>
+<td width="50%"><img src="test_example/SolidWorks/1_playstation_controller/evidence/blindspot/map_submitted_grader.png" alt="Map with the submitted check"><br>Submitted check. Purple and beige: not checked.</td>
 <td width="50%"><img src="test_example/SolidWorks/1_playstation_controller/evidence/blindspot/map_tight_zones.png" alt="Map with Tight Zones"><br>Tight Zones. Far less purple.</td>
 </tr></table>
 
