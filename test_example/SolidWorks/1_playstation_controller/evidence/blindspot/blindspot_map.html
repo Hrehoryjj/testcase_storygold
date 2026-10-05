@@ -67,6 +67,12 @@ code { font-family: var(--mono); font-size: .9em; }
 footer { color: var(--muted); font-size: .85rem; border-top: 1px solid var(--line); padding-top: 14px; }
 a { color: var(--accent); }
 .fallback[hidden] { display: none; }
+.now { margin: 0; font-size: .92rem; color: var(--fg); }
+.howto dl { display: grid; grid-template-columns: minmax(0, 11rem) minmax(0, 1fr); gap: 8px 16px; margin: 0; }
+.howto dt { font-weight: 600; }
+.howto dd { margin: 0; color: var(--muted); }
+.howto h3 { font: 600 .74rem/1.2 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 8px 0 0; }
+@media (max-width: 520px) { .howto dl { grid-template-columns: minmax(0, 1fr); gap: 2px; } .howto dd { margin-bottom: 8px; } }
 .fallback { position: absolute; inset: 0; display: grid; place-items: center; padding: 16px; text-align: center; color: var(--muted); }
 </style>
 
@@ -93,6 +99,7 @@ a { color: var(--accent); }
       <div class="cam"><button class="reset" id="top" type="button">Top</button><button class="reset" id="under" type="button">Underside</button></div>
     </div>
     <div class="legend">
+      <p class="now" id="now"></p>
       <div class="scale">
         <div class="scale-title" id="scaleTitle">Share of the <span data-nreal>four</span> real edits caught at that spot</div>
         <div class="ramp" id="ramp" aria-hidden="true"></div>
@@ -109,6 +116,27 @@ a { color: var(--accent); }
   </div>
 
   <div class="figs" id="figs"></div>
+
+  <section class="howto">
+    <h2>What the buttons mean</h2>
+    <h3>Grader</h3>
+    <dl>
+      <dt>Submitted</dt><dd>The "no unrequested changes" check as it was handed in. Purple and beige show where it does not look.</dd>
+      <dt>Tight Zones (proposed)</dt><dd>The stronger version of the same check. Its skipped zones are much narrower, so far less of the housing is purple.</dd>
+    </dl>
+    <h3>View</h3>
+    <dl>
+      <dt>All four edits</dt><dd>At each spot, how many of the four real edits below are caught. Blue means all four, red means none.</dd>
+      <dt>Boss 0.15 mm</dt><dd>A raised disc 8 mm across and 0.15 mm high, about the smallest step the check is meant to see. Blue caught, red missed.</dd>
+      <dt>Boss 0.5 mm</dt><dd>The same disc, 0.5 mm high.</dd>
+      <dt>Boss 3 mm</dt><dd>The same disc, 3 mm high: an extra anyone would notice at once.</dd>
+      <dt>Through hole</dt><dd>A hole 8 mm across through the housing wall.</dd>
+      <dt>False alarms: split line</dt><dd>The disc becomes its own face but the shape does not change, as an imprinted sketch does. It must not be flagged: blue means left alone, red means flagged by mistake.</dd>
+      <dt>False alarms: re-mesh</dt><dd>The disc is meshed finer and its points move up to 0.05 mm, as with another mesh quality setting. It must not be flagged either.</dd>
+      <dt>Context: reshaped surface</dt><dd>Grey where the reference keeps the original surface, orange where the reference rebuilt it, so the original part cannot serve as a template there.</dd>
+      <dt>Show spots</dt><dd>Marks the measured spots. Colour between spots is filled in from nearby spots that face the same way.</dd>
+    </dl>
+  </section>
 
   <section>
     <h2>Per edit</h2>
@@ -173,6 +201,15 @@ document.querySelectorAll("[data-nreal]").forEach(el => el.textContent = nReal);
 const pct = (a, b) => Math.round(100 * a / b) + "%";
 
 // figures and table
+const GTXT = {"today": "Submitted grader: the check as it was handed in. Purple and beige are the zones it skips.", "tight": "Tight Zones: the proposed stronger check. Its skipped zones are much narrower."};
+const VTXT = v => v === "all" ? "Colour shows how many of the four real edits are caught at each spot."
+  : v === "seed" ? "Where the reference rebuilt the housing compared with the original part."
+  : v.startsWith("split") ? "A split line that does not change the shape. It should never be flagged."
+  : v.startsWith("re-mesh") ? "A finer mesh of the same shape. It should never be flagged."
+  : v === "hole" ? "An 8 mm through hole. Blue where it is caught, red where it is missed."
+  : `A ${v.replace("boss ", "")} high boss, 8 mm across. Blue where it is caught, red where it is missed.`;
+let curView = "all";
+function caption() { document.getElementById("now").textContent = GTXT[grader] + " " + VTXT(curView); }
 function figures() {
 const outer = S.spots + S.exempt_strip + S.exempt_controls;
 const fa = HARM.reduce((n, e) => n + S.per_edit[e], 0);
@@ -197,7 +234,7 @@ document.getElementById("kMargin").textContent = tight
   ? "1.5 mm zone around each control (4 mm for sticks, bumpers, triggers): still skipped"
   : "8 mm margin around controls: the check skips it, a real blind spot";
 }
-figures();
+figures(); caption();
 
 // view chips
 const label = v => v === "all" ? allLabel : v === "seed" ? "Context: reshaped surface" : v === "hole" ? "Through hole" : HARM.includes(v) ? `False alarms: ${v}` : v.replace("boss", "Boss");
@@ -215,7 +252,7 @@ const graders = document.getElementById("graders");
 function setGrader(g) {
   grader = g; S = SETS[g].summary; codes = CODES[g];
   graders.querySelectorAll(".chip").forEach(c => c.setAttribute("aria-pressed", c.dataset.g === g));
-  figures(); onGrader();
+  figures(); caption(); onGrader();
 }
 if (location.hash === "#tight") setTimeout(() => setGrader("tight"));
 graders.addEventListener("click", e => { const b = e.target.closest(".chip"); if (b) setGrader(b.dataset.g); });
@@ -307,7 +344,7 @@ if (!renderer || typeof THREE.OrbitControls !== "function") {
   }
   chips.addEventListener("click", e => {
     const b = e.target.closest(".chip"); if (!b) return;
-    view = b.dataset.v;
+    view = b.dataset.v; curView = view; caption();
     chips.querySelectorAll(".chip").forEach(c => c.setAttribute("aria-pressed", c === b));
     paint();
   });
