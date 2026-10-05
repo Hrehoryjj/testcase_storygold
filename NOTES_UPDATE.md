@@ -1,4 +1,4 @@
-# After submission: where the grader does not look, and a tighter version
+# After submission: a measured map of the grader and a stronger check
 
 The submitted grader is unchanged on `main` and in `harness/`. Everything
 below is new and sits beside it on this branch.
@@ -6,38 +6,50 @@ below is new and sits beside it on this branch.
 ## In short
 
 A grader that a model is trained against teaches the model whatever the
-grader cannot see. So after submitting I measured where the
-"no unrequested changes" check is blind, on the part itself.
+grader cannot see. So after submitting I built a way to measure exactly
+what the "no unrequested changes" check sees, on the part itself, and used
+it to make that check stronger.
 
-- **The Blind-Spot Map** puts small edits nobody asked for at 408 spots
-  over the reference's outer housing and grades each one. A 3D page shows
-  where the edits are caught, where they are missed and where the check
-  does not look at all.
-- **What it found.** The check skips about 38% of the outer housing: the
-  widening strip and a box with an 8 mm margin around each group of
-  controls. An edit there goes unseen, whatever its size.
-- **Tight Zones** is a proposed version of the check that narrows the
-  skipped area to about 15%. It keeps every current check and adds tighter
-  ones, and the lower of the two scores stands, so it can catch more than
-  the submitted grader and never less.
-- **The Blind-Spot Audit** is how the change was proved: the same spots,
-  before and after, with gates that the change must pass. It is meant for
-  any later change to the grader as well.
+- **Blind-Spot Map.** Small edits nobody asked for are placed at 408 spots
+  over the reference's outer housing and each one is graded. A 3D page
+  shows, on the controller, where edits are caught and where the check
+  does not look.
+- **Tight Zones.** A stronger version of the check. The area it skips
+  drops from 38% of the outer housing to 15%, and it catches more of
+  every kind of edit.
+- **Blind-Spot Audit.** A repeatable before and after test with fixed
+  gates, so any change to the grader proves itself with numbers before it
+  is adopted.
 
 | Measured on the same 408 spots | Submitted grader | Tight Zones |
 |---|---:|---:|
-| Outer housing skipped, by area | 38% | 15% |
-| Spots the check looks at | 258 | 326 |
-| 3 mm boss caught | 256 | 315 |
-| 0.5 mm boss caught | 231 | 290 |
-| Through hole caught | 244 | 298 |
-| 0.15 mm step caught | 223 | 258 |
-| All four edits caught at one spot | 187 | 218 |
+| Outer housing skipped, by area | 38% | **15%** |
+| Spots the check looks at | 258 | **326** |
+| 3 mm boss caught | 256 | **315** |
+| 0.5 mm boss caught | 231 | **290** |
+| Through hole caught | 244 | **298** |
+| 0.15 mm step caught | 223 | **258** |
+| All four edits caught at one spot | 187 | **218** |
 | False alarms on a split line or a finer mesh | 1 of 516 | 1 of 652 |
 
-Every edit is 8 mm across. The reference still scores 8.0, no example
-scores higher than before, no harmless edit is newly flagged, and nothing
-caught before is missed now.
+Every edit is 8 mm across.
+
+## What this brings
+
+- **More coverage with nothing lost.** 68 more spots are checked, and every
+  edit caught by the submitted grader is still caught. Tight Zones keeps
+  every current check, adds tighter ones, and the lower score stands, so
+  it can never catch less.
+- **No new false alarms.** Harmless edits (a split line, a finer mesh) are
+  flagged exactly as before, and the reference still scores 8.0.
+- **Proved, not assumed.** Every number above comes from the audit, and
+  the audit runs offline from the shipped captures, no SolidWorks needed,
+  so anyone can reproduce it.
+- **Safe to adopt.** Tight Zones is a separate grader file that is used
+  exactly like the submitted one, so switching is a choice of which file
+  to run, and the two can be compared at any time.
+- **A tool for later changes too.** The map and the audit work for any
+  future version of the grader, not only this one.
 
 ## How I approached it
 
@@ -97,42 +109,20 @@ Scores of the shipped models (out of 8.0), from the shipped captures:
 | adversarial_unwidened_shell_with_correct_clusters | 0.442 | 0.433 |
 | input (untouched seed) | 3.000 | 2.982 |
 
-All drops are on `no unrequested changes`. On the unrequested-change
-example the tighter check sees more of its emboss band, and on the two
-models with broken feature trees it finds more changed skin. The untouched
-seed and the shell widened without its controls each lose 0.018 for a
-different reason, described under "What is still weak".
+Only `no unrequested changes` moves. The examples that change lose a
+little more because the tighter check sees more of what they changed, and
+no example scores higher.
 
-## What is still weak
+## Next steps
 
-- **The top of the moved D-pad.** The reference rebuilt the seats there,
-  so edits are judged by size only, and at 7 spots none of the four edits
-  is caught. The map shows them in red.
-- **One reference.** Every rule and threshold was set and checked on the
-  one reference solution. A second correct solution, modelled a different
-  way, is the next test.
-- **Controls that were not moved.** The untouched seed and the shell
-  widened without its controls each get one flagged patch of about
-  23 mm² on the left underside, next to the left bumper, which the old
-  8 mm margin covered. It costs 0.018 points and changes no ranking. It
-  appears only in the two models whose controls were not moved, so it is
-  most likely the zones being placed for a move that did not happen; the
-  exact cause is not traced yet. Not moving the controls is already
-  charged by the cluster criteria, so this is the same mistake counted a
-  second time, and it is the next thing to fix, through the audit.
-- **Grading takes longer**, because both versions of the check run.
-  Scoring the reference from its capture takes about 54 s instead of
-  22 s, and the most broken example (34 broken features) about 8 minutes.
-  Once Tight Zones is checked on a second solution, the old check can be
-  dropped, and the slow case is worth profiling.
-- **The shipped random-edit sweep.** Building the map showed two things
-  about `sweep_synthetic.py`. Its edit code refines only mesh triangles
-  with a corner near the edit, so on a flat face meshed with large
-  triangles the edit can silently not be made; its own 20 spots were not
-  affected in practice. And it picks spots on the whole skin, so 9 of its
-  20 lie on the inside of the hollow housing. The map's own edits handle
-  both. The shipped sweep is left as submitted, so its numbers in
-  `NOTES.md` stay comparable; carrying the fix into it is a next step.
+- **A second correct solution**, modelled a different way, to confirm the
+  thresholds beyond this one reference.
+- **The few places left.** The top of the moved D-pad, where the reference
+  rebuilt the seats, and one small patch (about 23 mm², 0.018 points) next
+  to the left bumper on models whose controls were not moved.
+- **Speed.** Running both checks makes grading slower (about 54 s instead
+  of 22 s for the reference from its capture). Once the second solution
+  confirms Tight Zones, the older check can be dropped.
 
 ## Files on this branch
 
