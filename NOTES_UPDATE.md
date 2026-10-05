@@ -1,157 +1,130 @@
-# After submission: a measured map of the grader and a stronger check
+# Finding and closing the grader's blind spots
 
-The submitted grader is unchanged on `main` and in `harness/`. Everything
-below is new and sits beside it on this branch.
+**Live 3D map:** https://claude.ai/artifact/RWEdixdQpN5UHgjzMpNGs8 (switch between the submitted and the improved check)
 
-## In short
+The version I submitted is unchanged on `main`. Everything here is an
+addition on this branch.
 
-A grader that a model is trained against teaches the model whatever the
-grader cannot see. So after submitting I built a way to measure exactly
-what the "no unrequested changes" check sees, on the part itself, and used
-it to make that check stronger.
+**Scope.** This is a method for finding and closing a grader's blind spots,
+shown on one criterion. The same approach applies to every criterion (see
+Possible improvements). I started with "no unrequested changes" because it
+is the broadest, covering the whole surface the task did not ask to change.
+It is also the hardest to grade, since it must tell requested changes from
+unrequested ones, and a gap in it is the cheapest for a trained model to
+exploit: an edit there costs nothing.
 
-- **Blind-Spot Map.** Small edits nobody asked for are placed at 408 spots
-  over the reference's outer housing and each one is graded. A 3D page
-  shows, on the controller, where edits are caught and where the check
-  does not look.
-- **Tight Zones.** A stronger version of the check. The area it skips
-  drops from 38% of the outer housing to 15%, and it catches more of
-  every kind of edit.
-- **Blind-Spot Audit.** A repeatable before and after test with fixed
-  gates, so any change to the grader proves itself with numbers before it
-  is adopted.
+## Why this matters
 
-| Measured on the same 408 spots | Submitted grader | Tight Zones |
+The grader scores CAD models that an AI makes for this task: widen a game
+controller by 15 mm and move its buttons for left-handed use. An AI trained
+against a grader learns to exploit whatever the grader does not check, the
+way a student learns which topics never come up in the exam.
+
+One of the grader's checks, "no unrequested changes", is there to catch
+edits nobody asked for. If it does not look at part of the controller, a
+model can change that part freely and still get full marks.
+
+## The problem
+
+The task itself changes the area around the buttons and the strip where the
+controller is widened, so the check has to ignore those areas. It ignored
+them generously: **about 38% of the controller's outer surface was not
+checked at all**, whatever the size of an edit there.
+
+## What I did
+
+1. **Measured it.** A tool places small test edits (bumps from 0.15 to 3 mm
+   high and holes, all 8 mm across) at 408 points over the surface, grades
+   each one, and paints the result on a 3D model of the controller: the
+   Blind-Spot Map.
+2. **Narrowed the ignored areas.** Instead of one wide box around each group
+   of buttons, a tight zone around each button. The button pads that the
+   task moves to the other side are compared with their mirror image, and
+   the widened middle is compared with the original cross-section. The old
+   check still runs alongside and the lower score counts, so the new
+   version can only catch more, never less. This is Tight Zones.
+3. **Proved it.** A before and after audit on the same 408 points with
+   rules fixed in advance: the correct solution keeps full marks, no wrong
+   model scores higher, no harmless edit is flagged, and nothing caught
+   before is missed now. All rules pass.
+
+## Result
+
+<table><tr>
+<td width="50%"><img src="test_example/SolidWorks/1_playstation_controller/evidence/blindspot/map_submitted_grader.png" alt="Map with the submitted check"><br>Submitted check. Purple: not checked.</td>
+<td width="50%"><img src="test_example/SolidWorks/1_playstation_controller/evidence/blindspot/map_tight_zones.png" alt="Map with Tight Zones"><br>Tight Zones. Far less purple.</td>
+</tr></table>
+
+Blue means test edits are caught, red means they are missed.
+
+| Same 408 points | Submitted | Tight Zones |
 |---|---:|---:|
-| Outer housing skipped, by area | 38% | **15%** |
-| Spots the check looks at | 258 | **326** |
-| 3 mm boss caught | 256 | **315** |
-| 0.5 mm boss caught | 231 | **290** |
-| Through hole caught | 244 | **298** |
+| Outer surface not checked | 38% | **15%** |
+| Points checked | 258 | **326** |
+| 3 mm bump caught | 256 | **315** |
+| Hole caught | 244 | **298** |
 | 0.15 mm step caught | 223 | **258** |
-| All four edits caught at one spot | 187 | **218** |
-| False alarms on a split line or a finer mesh | 1 of 516 | 1 of 652 |
+| False alarms on harmless edits | 1 | 1 |
 
-Every edit is 8 mm across.
+Also confirmed:
 
-## What this brings
+- **A live SolidWorks run** scores the correct solution 8.0 of 8.0.
+- **All 10 shipped models** keep their ranking, and none scores higher.
+  Their scores are in `evidence/envelopes_tight_zones/`.
+- **The shipped self-test** passes 88 of its 90 checks. The two it flags
+  are the small double penalty listed under Possible improvements.
 
-- **More coverage with nothing lost.** 68 more spots are checked, and every
-  edit caught by the submitted grader is still caught. Tight Zones keeps
-  every current check, adds tighter ones, and the lower score stands, so
-  it can never catch less.
-- **No new false alarms.** Harmless edits (a split line, a finer mesh) are
-  flagged exactly as before, and the reference still scores 8.0.
-- **Proved, not assumed.** Every number above comes from the audit, and
-  the audit runs offline from the shipped captures, no SolidWorks needed,
-  so anyone can reproduce it.
-- **Safe to adopt.** Tight Zones is a separate grader file that is used
-  exactly like the submitted one, so switching is a choice of which file
-  to run, and the two can be compared at any time.
-- **A tool for later changes too.** The map and the audit work for any
-  future version of the grader, not only this one.
+## Possible improvements
 
-## How I approached it
+Each of these is a known, scoped next step. Every change to the grader goes
+through the same audit (about 2.5 hours per run), so I shipped one change
+proven end to end rather than several partly checked ones.
 
-1. **Measure before changing.** The random-edit sweep shipped with the
-   grader tests 20 spots. That is enough to show the checks work, not
-   enough to show where they do not. The map tests 408 spots spread evenly
-   over the outer skin, four real edits and two harmless ones at each, and
-   draws the result on the part, so a blind area shows up as a patch
-   rather than a number.
-2. **Find the cause.** The map showed the misses were not spread out: they
-   were the zones the check skips on purpose. The zones exist because the
-   reference rebuilds its button wells, stick rings and the widened middle,
-   so the original part cannot say what the surface there should be. But
-   the zones were much wider than those rebuilds.
-3. **Set the bar before the change.** The audit's gates were fixed first:
-   the reference keeps full marks, no broken example scores higher, no
-   harmless edit is newly flagged, and nothing caught before is missed.
-4. **Change, measure, repeat.** Each version of Tight Zones was audited on
-   the same spots. Rules that charged the reference or lost a catch were
-   reworked until every gate passed.
-5. **Keep it reversible.** The change is a separate grader file, so the
-   submitted grader can be compared with it at any time, and adopting it
-   is a one-line choice of which file to run.
+- **Apply the method to every criterion.** Plant a controlled mistake in
+  the correct solution and check that the right criterion catches it, and
+  only that one: widen by 10 to 30 mm, shift one button by 0.5 to 5 mm,
+  push a button into the wall, remove a button symbol, mirror the whole
+  part naively, break a few features. Each criterion then gets a measured
+  sensitivity, for example "catches a button shifted by X mm". This runs
+  offline on the saved measurements, about 2 to 3 days for all criteria,
+  plus a fix wherever a gap is found.
+- **Test on a second correct solution.** All thresholds were checked on the
+  one reference solution provided. Building a second solution in a
+  different way and running the audit on it is the best guard against
+  penalising a correct model. It needs a new SolidWorks model, so it is the
+  next validation step rather than more tuning on one part.
+- **Close the last weak spot, on top of the moved D-pad.** The reference
+  rebuilds the button seats there, so there is no original surface to
+  compare with, and at 7 points none of the test edits is caught. The
+  likely fix is to compare those seats with their mirror image on the
+  original part, the method that already works for the button pads.
+- **Remove a small double penalty.** On models whose buttons were never
+  moved, one patch of about 23 mm² is flagged (0.018 points, no change in
+  ranking). Those models already lose points for not moving the buttons.
+  The likely fix is to place the tight zones only where buttons actually
+  moved.
+- **Make it faster.** Running both checks takes about 54 s per model
+  instead of 22 s, and longer on heavily broken models. Keeping the old
+  check is what guarantees "never catches less" today. Once the second
+  solution confirms Tight Zones, the old check can be dropped.
 
-## What Tight Zones changes
+## Files
 
-- **A zone per control, not per group.** A box around each control body,
-  1.5 mm wider (4 mm for sticks, bumpers and triggers, whose rings and
-  housings the reference opens slightly), at its new place and at its
-  original place.
-- **Button pads compared across the plane.** The task moves the D-pad and
-  the face buttons to the other side, so the pad around them is compared
-  with the original pad mirrored to its new side instead of being skipped.
-- **The middle is checked.** The original's section at the mirror plane is
-  drawn across the added width, and the candidate's middle must lie on it.
-  Only a narrow band where each half meets the middle is skipped.
-- **Small centred features may stay centred.** A feature that sits across
-  the plane, within 11 mm of it, may be split with the halves or kept in
-  the middle, as the reference does.
-- **Where the original part is itself not symmetric**, the mirror check
-  does not charge the candidate for it.
-- **A rebuild cut into pieces by the zones is judged as one**, so a seat
-  the reference rebuilt does not read as several edits.
-
-Scores of the shipped models (out of 8.0), from the shipped captures:
-
-| Model | Submitted grader | Tight Zones |
-|---|---:|---:|
-| solution (reference) | 8.000 | 8.000 |
-| adversarial_unrequested_change_elsewhere | 7.726 | 7.712 |
-| adversarial_missing_glyphs | 7.000 | 7.000 |
-| adversarial_widened_by_30mm | 6.500 | 6.500 |
-| adversarial_text_mirrored_incorrectly | 6.300 | 6.300 |
-| adversarial_only_one_button_cluster_mirrored | 6.059 | 6.059 |
-| adversarial_widened_15mm_clusters_at_original_spacing | 3.211 | 3.193 |
-| adversarial_feature_tree_with_errors | 2.780 | 2.761 |
-| adversarial_unwidened_shell_with_correct_clusters | 0.442 | 0.433 |
-| input (untouched seed) | 3.000 | 2.982 |
-
-Only `no unrequested changes` moves. The examples that change lose a
-little more because the tighter check sees more of what they changed, and
-no example scores higher.
-
-## Next steps
-
-- **A second correct solution**, modelled a different way, to confirm the
-  thresholds beyond this one reference.
-- **The few places left.** The top of the moved D-pad, where the reference
-  rebuilt the seats, and one small patch (about 23 mm², 0.018 points) next
-  to the left bumper on models whose controls were not moved.
-- **Speed.** Running both checks makes grading slower (about 54 s instead
-  of 22 s for the reference from its capture). Once the second solution
-  confirms Tight Zones, the older check can be dropped.
-
-## Files on this branch
-
-| Path (under `test_example/`) | What it is |
+| Where (under `test_example/`) | What |
 |---|---|
-| `SolidWorks/1_playstation_controller/tests/task/harness_tight_zones/` | The Tight Zones grader, its README and a diff against the submitted grader |
-| `tools/blindspot_map.py`, `tools/build_blindspot_page.py`, `tools/blindspot_page_template.html` | The Blind-Spot Map |
-| `tools/blindspot_audit.py`, `tools/BLINDSPOT_AUDIT.md` | The Blind-Spot Audit and how to use it |
-| `SolidWorks/1_playstation_controller/evidence/blindspot/` | The 3D map (open it in a browser and switch between the two graders), the before and after report, and two pictures |
+| `SolidWorks/1_playstation_controller/tests/task/harness_tight_zones/` | The improved grader, used exactly like the submitted one |
+| `SolidWorks/1_playstation_controller/evidence/blindspot/` | The 3D map (open in a browser), the before and after report, pictures |
+| `SolidWorks/1_playstation_controller/evidence/envelopes_tight_zones/` | Scores of the 10 shipped models |
+| `tools/blindspot_map.py`, `tools/blindspot_audit.py`, `tools/BLINDSPOT_AUDIT.md` | The map, the audit and how to run them |
 
 ## Run it
-
-Grade a part with Tight Zones, exactly like the submitted grader:
 
 ```bat
 cd test_example\SolidWorks\1_playstation_controller
 python tests\task\harness_tight_zones\harness.py solution\solution.SLDPRT
 ```
 
-Without SolidWorks, from a shipped capture:
-
-```bash
-cd test_example/SolidWorks/1_playstation_controller
-gunzip -c evidence/captures/solution.json.gz > /tmp/solution.json
-python3 tests/task/harness_tight_zones/harness.py --score-from /tmp/solution.json
-```
-
-Audit the submitted grader and Tight Zones on the same spots (no
-SolidWorks, Python 3 only):
+The audit runs without SolidWorks, from the saved measurements:
 
 ```bash
 cd test_example
