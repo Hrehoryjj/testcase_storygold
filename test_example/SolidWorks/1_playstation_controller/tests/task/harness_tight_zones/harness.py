@@ -1,0 +1,4746 @@
+#!/usr/bin/env python3
+"""
+Task 1 (SolidWorks) -- PS3 controller: widen 15 mm + left-handed mirror.
+
+Grades a candidate .SLDPRT against prompt/input.json (frozen measurements of
+PS3-Controller_Base.SLDPRT).  Grading is geometry-only: mass properties,
+inertia signs, centroids, face-area moments -- never feature or body names
+(body order is unstable and candidates may remodel).
+
+The controller's mirror plane is x = plane_x_m (NOT x=0).  A correct edit:
+  - widens by 15 mm total (mirror-pair separations grow +15 mm)
+  - moves the dpad diamond to the right and the face-button diamond to the
+    left of the plane (left-handed layout), each as a RIGID unit
+  - keeps chiral one-sided housing features (port lights, text) on their
+    original side -- the housing is updated, not mirrored wholesale
+  - adds no interference among the controls
+  - changes nothing else (Y/Z spans, non-control body shapes)
+
+--------------------------------------------------------------------------
+SCORING MODEL
+--------------------------------------------------------------------------
+Every criterion returns a continuous subscore in [0, 1], so near-misses
+separate from each other and from outright failures.
+
+  * UNITS.  The SolidWorks API is metric SI: metres, m^2, m^3.  All scoring
+    formulas work in MILLIMETRES; conversion happens exactly once, at the
+    point of measurement, via MM.  Do not mix the two -- a millimetre
+    tolerance applied to a metre value silently zeroes every score.
+
+  * AGGREGATION.  Multi-item criteria average the PER-ITEM SCORES, never the
+    per-item errors.  Averaging errors lets +30 mm on one pair cancel 0 mm on
+    another and awards full marks to a deformed part.
+
+  * C1 is asymmetric about the target.  Overshoot means the operation was
+    performed and mis-sized; undershoot to zero means it was not performed.
+    Undershoot reaches 0 at delta=0, overshoot decays more slowly.
+
+  * C1 and C2 are independent.  C2 measures cluster placement against the
+    widening the candidate ACTUALLY applied (half_actual, derived from the
+    measured pair growth), not against the nominal +7.5 mm.  "Is the widening
+    the right size?" is C1; "are the clusters consistent with the shell?" is
+    C2.  One mistake is therefore charged once.
+
+  * C2 and C4 do not overlap.  C2 owns geometry (placement + rigidity), C4
+    owns sidedness.
+
+  * C4 is multiplicative.  Its witnesses are of two kinds.  POSITIVE ones
+    ("the conversion was performed"): cluster sides, body chirality.  GUARDS
+    ("...and not by mirroring the whole part"): the port-light glyph cluster,
+    the housing side signature.  Under a flat mean a candidate that did
+    nothing still satisfies both guards, having never mirrored the housing,
+    and collects their weight.  Guards are therefore a multiplier on positive
+    credit, floored at GUARD_FLOOR, and can only subtract.  The port-light
+    cluster dominates the guard: it is the sole detector of the naive flip
+    instruction.md warns about.
+
+  * ROLES ARE WEIGHTED (ROLE_WEIGHT).  instruction.md is about the button
+    clusters; the stick/trigger/bumper pairs are already what C1 grades.
+
+  * UNVERIFIABLE IS NOT FREE.  Unreadable witnesses drop out of their
+    weighted mean, but a wholly unreadable class resolves to
+    NEUTRAL_UNVERIFIABLE (0.5), never 1.0 -- otherwise destroying the
+    evidence is a winning strategy, which an RL policy will find.
+
+  * HEALTH GATE KEEPS THE ENVELOPE SHAPE.  A failed gate zeroes all five
+    criteria but still emits all five subscores, so max_score stays constant
+    and reports remain comparable across candidates.
+
+  * BODY MATCHING IS INDEPENDENT OF THE HYPOTHESES IT FEEDS.  Matching runs
+    on shape fingerprints (translation- and mirror-invariant) with position
+    only as a tie-break, and that tie-break uses the MIRROR hypothesis alone
+    -- never the widening hypothesis C1 grades.  Both the mirrored and the
+    identity hypothesis are costed and the cheaper one wins, so a candidate
+    that did not mirror is matched body-to-itself.  The chosen hypothesis and
+    its margin over the runner-up are reported.
+
+  * A LABEL THE HARNESS CANNOT MEASURE IS NOT USED.  The two button diamonds
+    are told apart by the small faces the d-pad's engraved arrows add.  When
+    a candidate leaves them indistinguishable the label falls out of body
+    enumeration order, which is not stable, so the identity is refused rather
+    than guessed: the role whose signature has no counterpart is scored as
+    missing, and the surviving one keeps the diamond nearer its expected
+    position.  See Grader._resolve_button_clusters().
+
+Scoring weights live in ALL_CRITERIA below and nowhere else.  task.toml used
+to carry a second copy of them, needed because a Harbor verifier container
+is given only solution/ and tests/ and so never sees that file.  Two copies
+with nothing comparing them is worse than one: task.toml now carries
+max_score and the harness carries the rubric.
+
+CLI (run `harness.py --help` for the full list):
+    python harness.py [candidate.SLDPRT]      grade (no arg = active document)
+    python harness.py --capture-only P        measure only, store the capture
+    python harness.py --score-from cap.json   score a capture, no SolidWorks
+    python harness.py --batch A B DIR ...     grade many, tabulate, write files
+    python harness.py --capture-baseline P    re-freeze prompt/input.json
+    python harness.py --capture-seed-rebuild  refresh only the rebuild census
+"""
+
+from __future__ import annotations
+
+import itertools
+import json
+import math
+import os
+import sys
+from collections import Counter
+from itertools import permutations
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+TASK_DIR = HERE.parent
+
+
+def _find_repo_root(start: Path) -> Path:
+    """Directory holding the shared `common` package.
+
+    Searched for rather than hard-coded by depth: the harness ships at two
+    different tree depths in this repo, so a fixed `parents[N]` breaks on one
+    of them.
+    """
+    d = start
+    for _ in range(8):
+        if (d / "common" / "__init__.py").is_file():
+            return d
+        if d.parent == d:
+            break
+        d = d.parent
+    return start.parents[4] if len(start.parents) > 4 else start
+
+
+_REPO_ROOT = _find_repo_root(HERE)
+#: `/opt` is where `common/` sits inside a Harbor verifier
+#: container, which has no repository around it to find.
+for _p in ("/opt", str(_REPO_ROOT / "SolidWorks"), str(_REPO_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from common import solidworks_measure as M                      # noqa: E402
+from common.solidworks_measure import z                         # noqa: E402
+from common import solidworks_capture as SC                     # noqa: E402
+from common import solidworks_session as SW                     # noqa: E402
+from common import harness_cli as HC                            # noqa: E402
+from common import harness_base as HB                           # noqa: E402
+from common.harness_base import (Harness, finalize,             # noqa: E402
+                                 score_error, write_env)
+
+BASELINE_PATH = TASK_DIR / "prompt" / "input.json"
+
+PASS, PARTIAL, FAIL, UNVERIFIABLE = "PASS", "PARTIAL", "FAIL", "UNVERIFIABLE"
+
+HARNESS_VERSION = "2.5.0"
+# Bumped whenever capture() changes what it records or what a field means.
+# /3 changed plane_x_m from "the baseline's plane" to "the plane this part
+# actually has". A /2 capture still scores correctly -- its plane equals the
+# baseline's, so the normalisation is a no-op -- but it cannot exercise the
+# translation handling, hence the warning rather than a refusal.
+CAPTURE_SCHEMA = "ps3-capture/7"
+# /5 adds `housing_halves`: where each half of the shell sits, which c1
+# uses as half of its widening evidence.
+# /6 adds `housing_faces`: one record per housing face (area, centroid,
+# outward normal, box, surface type, cylinder axis) with one surface sample
+# per 3 mm cell, for the c5 skin-split check.
+# /7 keeps every field of /6 and adds the full tessellation: each housing
+# face carries its triangles (`mv` / `mt`, see mesh_record), cones are
+# recorded like cylinders, and `control_meshes` holds every control body's
+# triangles. The skin checks resample the meshes at 1.5 mm when both seed
+# and candidate have them, and fall back to the 3 mm samples otherwise.
+# Older captures still score: c1 falls back to the mirror pairs, c5 skips
+# the skin checks, and each says so.
+
+#: HOW FAR THE MEASURED MIRROR MAY SIT from where the seed's mirror
+#: travelled to, before it is called a mis-detection rather than an
+#: edit. The widening this task asks for moves CONTROLS apart; it
+#: does not move the plane they are mirrored about. The slips seen
+#: in practice are tens of millimetres (80.5 -> 137.9, -> 122.9),
+#: so 25 mm separates them from anything an author would do on
+#: purpose without a re-freeze.
+PLANE_SLIP_MAX_MM = 25.0
+
+# The frozen seed measurement every candidate is compared against.
+# /2 added the modelling census and the per-role bounding boxes: without them
+# the hygiene criterion silently degrades to "new rebuild warnings only", and
+# nothing in the score says the seed is at fault. A /1 baseline still grades,
+# so the mismatch is reported rather than refused.
+BASELINE_SCHEMA = "ps-annotation-baseline/3"
+
+# Metres -> millimetres.  Applied once, where a measurement is taken.
+MM = 1000.0
+
+POLICY = {
+    "width_delta_mm": 15.0,      # +15 mm total
+    "half_mm": 7.5,              # 7.5 mm per side (nominal)
+    "handedness": "mirror about plane_x (dpad <-> face_buttons swap sides)",
+}
+
+C_HEALTH = "rebuild health"
+C_HYGIENE = "modelling hygiene"
+C_MARKINGS = "markings preserved"
+#: The rubric, in the order every report and batch column reads it. These
+#: numbers were duplicated in task.toml, which a Harbor verifier container
+#: never sees -- so the harness already carried them against exactly that
+#: case, and the file's copy was the one that could go stale. One copy now.
+#: WHAT TO KNOW ABOUT THIS TASK AND A JUDGEMENT. Every harness in
+#: this repository declares one of these, the ones that use no
+#: judge included: an absence cannot be told apart from an
+#: oversight, and `harness.py --judge` prints what it finds here.
+#: See `judge_runner.stance`.
+JUDGE_NOTE = (
+    "The one thing here that no measurement settles is also invisible "
+    "to a judge. The port-light glyphs are left-right symmetric split "
+    "faces, so a mirror of them is geometrically undetectable, and "
+    "whether a standard part is the right standard part is a name "
+    "question this repository grades nothing by. What is left -- a "
+    "shell widened without its controls moving -- is measurable and "
+    "simply not scored yet; the X span is already in the capture, "
+    "marked diagnostic. A wider witness base, not an opinion, is what "
+    "this task is short of."
+)
+
+
+ALL_CRITERIA = {
+    C_HEALTH: 0.5,
+    C_HYGIENE: 0.5,
+    "widened by 15 mm": 1.5,
+    "clusters at mirrored positions": 1.5,
+    "no new control interference": 0.5,
+    "left-handed layout achieved": 2.0,
+    "no unrequested changes": 0.5,
+    # instruction.md: "any text, logos, and standard/purchased parts (e.g.
+    # joystick caps) must remain legible and correctly oriented". The
+    # naive-flip guard inside `left-handed layout achieved` reads the
+    # "correctly oriented" half. This reads the "remain" half, which had no
+    # reader at all -- a candidate could erase all four face-button symbols
+    # and score 7.000. Its own criterion rather than a component of `no
+    # unrequested changes`, which is worth 0.5 in total and cannot express
+    # this without being re-weighted itself; max_score becomes 8.0.
+    C_MARKINGS: 1.0,
+}
+GEOMETRY_CRITERIA = tuple(k for k in ALL_CRITERIA
+                          if k not in (C_HEALTH, C_HYGIENE))
+
+TOL = {
+    # -- C0: rebuild health, graded on the fraction of features newly
+    # broken so it transfers to trees of a different size -------------------
+    "health_perfect_frac": 0.0,
+    # 1.5x stricter than the 0.20 it was. The health score is now also the
+    # trust multiplier on every geometry criterion (see grade()), so it has
+    # to fall faster than when it only priced itself at 0.5 of 8.0: 5% of
+    # the tree newly broken now keeps 0.61 of the geometry credit, 13.3%
+    # keeps none.
+    "health_zero_frac": 0.20 / 1.5,
+    # -- C0: modelling hygiene, all deltas against the seed -----------------
+    "warn_perfect": 0.0,
+    "warn_zero": 5.0,
+    "sketch_perfect": 0.0,      # sketches in a status the seed never had
+    "sketch_zero": 5.0,
+    # Calibrated: the reference suppresses one feature as part of its own
+    # edit, so a growth of one must not cost marks. Revisit once the corpus
+    # contains a candidate that suppresses features to dodge a check.
+    "suppressed_perfect": 1.0,
+    "suppressed_zero": 6.0,
+    "extref_perfect": 0.0,      # new external references
+    "extref_zero": 3.0,
+    # -- C1: widening, asymmetric about the +15 mm target -------------------
+    "width_perfect_mm": 0.5,     # full marks inside +/-0.5 mm
+    "width_zero_under_mm": 15.0,   # undershoot: 0.0 when delta == 0
+    "width_zero_over_mm": 22.5,    # overshoot:  0.0 when delta == 37.5
+    # -- C1: housing halves (the shell itself, not the controls on it) -------
+    "halves_deadband_mm": 2.0,   # faces nearer the plane belong to no half
+    # The shell half of c1 is not sized against +15 mm: the reference grows
+    # its halves +20.6 mm because it remodels the grips. Full credit from
+    # +15 mm up to twice the requested width, none at three times it.
+    "shell_full_to_mm": 30.0,
+    "shell_zero_at_mm": 45.0,
+    # -- C2: cluster geometry ----------------------------------------------
+    "intra_perfect_mm": 0.5,     # rigid-diamond internal spacing
+    "intra_zero_mm": 5.0,
+    # Calibrated against solution.SLDPRT, which places its clusters 3.00 mm
+    # (dpad) and 2.52 mm (face_buttons) from the ideal mirror+widen point:
+    # the reference remodels rather than translating rigid bodies, so a few
+    # millimetres of drift is correct behaviour, not error.
+    "cluster_perfect_mm": 4.0,   # cluster centre vs adaptively expected pos
+    "cluster_zero_mm": 12.0,
+    # -- C3: interference ---------------------------------------------------
+    "intf_perfect_m3": 5e-9,     # 5 mm^3 of new control interference is free
+    "intf_zero_m3": 5e-8,        # 50 mm^3 scores nothing
+    # -- C3: seated controls (a control in a round opening stays in one) ----
+    "coax_open_max_r_mm": 30.0,  # a vertical housing cylinder this small
+    "coax_axis_dot": 0.95,       #   is an opening a control can sit in
+    "coax_seed_mm": 1.0,         # seated in the seed: centre this near an axis
+    "coax_perfect_mm": 1.0,      # candidate offset from the nearest opening
+    "coax_zero_mm": 5.0,
+    "coax_radius_perfect_mm": 0.2,   # that opening's radius vs the seed's
+    "coax_radius_zero_mm": 2.0,
+    # -- C3: clearances (every control keeps its gap to its own opening) ----
+    "gap_rays": 16,              # horizontal directions around each control
+    "gap_level_mm": 0.5,         # horizontal sections through the control
+    "gap_reach_mm": 8.0,         # housing further out than this is not its
+                                 #   opening
+    "gap_back_mm": 2.0,          # housing this far inside the control's
+                                 #   outline counts as a negative gap
+    "gap_perfect_mm": 0.15,      # narrowing of the tightest gap on a ray;
+    "gap_zero_mm": 0.6,          #   the reference narrows none by more than
+                                 #   0.01, the seed's gaps are 0.03-0.16
+    # -- C4: handedness witnesses ------------------------------------------
+    # A rigid X translation smaller than this is measurement noise, not a
+    # moved origin, and is left alone.
+    "plane_shift_ignore_mm": 1.0,
+    "straddle_mm": 12.0,         # cluster centred on the plane = no side
+    "chiral_floor": 1e-3,        # inertia-product ratio below = unverifiable
+    "sig_floor_frac": 0.2,       # candidate |moment3| vs baseline's to count
+
+    # -- housing engraved-detail side (the second naive-flip guard) --------
+    # Faces this small are markings, not structure: a re-shell adds large
+    # interior faces and none of these, which is what makes the witness
+    # survive the remodel that kills sig_floor_frac above.
+    # UNVERIFIABLE below the floor rather than scored: an even left/right
+    # split carries no side, and reading noise as a verdict is worse than
+    # admitting the measurement failed.
+    "detail_asym_floor": 0.05,      # |right-left| / total, below = no signal
+    "detail_deadband_mm": 2.0,      # faces nearer the plane have no side
+    "housing_remodel_fp": 0.5,   # fingerprint drift above = housing remodeled
+    # -- C5: unrequested changes -------------------------------------------
+    # Calibrated: the reference drifts 1.24 mm in Z and 0.01 mm in Y, which
+    # is its remodelling noise rather than an unrequested change.
+    "span_perfect_mm": 2.0,      # Y/Z span drift
+    "span_zero_mm": 6.0,
+    # Measured worst-case fingerprint drift on the non-exempt bodies
+    # (sticks, triggers, bumpers) is 2.3e-05 across every model that grades,
+    # identical in two separate SolidWorks sessions. 2.5.0 tightens the band
+    # from 0.01 / 0.08 (400x the noise, which let a 1 mm boss 8 mm across on
+    # a stick through for free) to ~9x the noise: a boss or pocket about
+    # 4 mm across and 0.5 mm high now costs points, 8 mm by 1 mm costs all.
+    "fp_perfect": 2e-4,
+    "fp_zero": 2e-3,
+    # -- C5: skin splits (a new face cut into an old one) --------------------
+    "skin_on_mm": 0.3,           # a sample this close to the moved seed skin
+    "skin_normal_dot": 0.9,      #   and facing the same way lies on it
+    "skin_face_frac": 0.7,       # share of a face that must lie on the skin
+    "skin_margin_mm": 8.0,       # the current rule: strip and control groups
+    # Tight Zones
+    "tz_control_margin_mm": 1.5,  # around each control body
+    "tz_role_margin_mm": {"sticks": 4.0, "bumpers": 4.0, "triggers": 4.0},
+    "tz_join_mm": 1.5,           # band at each join of a half and the middle
+    "tz_reg_slack_mm": 0.5,      # how far a half may sit off the task's move
+    "tz_mirror": True,           # compare swapped pads with the mirrored seed
+    "tz_pad_reach_mm": 12.0,     # pad box: the cluster's box and this much
+    "tz_pad_face_share": 0.9,    # a seed face this much inside it is a pad
+    "tz_pad_step_mm": 0.25,      # step a piece needs on a mirrored pad
+    "tz_pad_hole_min": True,     # intact-face hole size on mirrored pads
+    "tz_sweep": True,            # check the middle against the swept section
+    "tz_sweep_span_mm": 11.0,    # a face swept must run this far past the
+                                 # plane on both sides; a smaller one across
+                                 # the plane is a centred feature
+    "tz_seed_sym_gate": True,    # a one-sided patch where the seed itself is
+                                 # one-sided is the seed's, not an edit
+    "tz_asym_buffer_mm": 3.0,    # around seed skin that has no mirror image
+    "skin_piece_min_mm2": 5.0,   # a sliver below this is not a piece
+    "skin_step_mm": 0.1,         # a piece must sit this far off its sibling
+    "skin_perfect_mm2": 20.0,    # extra area below this is tessellation
+    "skin_half_mm2": 60.0,       # 0.5 here: any real insert costs half
+    "skin_zero_mm2": 2000.0,
+    # -- C5: skin holes (part of an old face no longer there) ----------------
+    "skin_lateral_cells": 1.5,   # a candidate sample this near, sideways
+                                 #   (in sample cells), can stand for a seed
+                                 #   sample (schema /6 samples only; meshes
+                                 #   are asked exactly), and links two
+                                 #   missing ones into one patch
+    "skin_intact_frac": 0.8,     # a seed face less than this in place was
+                                 #   rebuilt by the candidate
+    "skin_hole_min_mm2": 20.0,   # a hole smaller than this is tessellation
+    "skin_rebuilt_min_mm2": 60.0,   # on a rebuilt face a patch this size is
+                                 #   an edit (the reference's screw holes on
+                                 #   its rebuilt grips are about 33 mm2)
+    "skin_rebuilt_max_mm2": 500.0,  # and a bigger one is the rebuild itself
+                                 #   (the reference's are about 1,100 mm2)
+    "skin_mirror_pad_mm": 5.0,   # the rebuilt faces' boxes, grown this much
+    "skin_mirror_reach_mm": 2.0,  # the candidate's own mirror plane is
+                                 #   searched this far about the seed's
+    "skin_reg_step_mm": 0.25,    # registration of each shell half in X
+    "skin_reg_pad_mm": 2.0,      #   searched this far beyond both witnesses
+    "skin_reg_samples": 400,
+    # -- body matching ------------------------------------------------------
+    "match_fp_weight": 1.0,      # cost per unit of fingerprint distance
+    "match_pos_weight_per_mm": 0.02,   # cost per mm of positional residual
+}
+
+MIRROR_ROLES = ["dpad", "face_buttons", "sticks", "triggers", "bumpers",
+                "centre"]
+# Clusters with a determinate expected position under mirror+widen: only the
+# two button diamonds.
+#
+# A mirror-symmetric PAIR (sticks, triggers, bumpers) is invariant as a set
+# under reflection -- its mean centre sits on the plane before and after --
+# so "did this cluster reach its mirrored position?" is trivially true for
+# pairs regardless of what the candidate did, and duplicates what c1 already
+# measures via their separation.  Pair handedness is real but unreadable from
+# position; body chirality witnesses it in c4 instead.
+#
+# centre (select/start/ps) is excluded for a different reason: it hugs the
+# plane, and "adjust spacing accordingly" is satisfiable by mirror-only or
+# mirror+spread -- the reference uses mirror-only.
+POSITION_ROLES = ["dpad", "face_buttons"]
+CHIRAL_ROLES = ["sticks", "triggers", "bumpers", "dpad"]
+RIGID_ROLES = ["dpad", "face_buttons"]
+# engineer-remodel exemptions for the reshape check
+RESHAPE_EXEMPT = ["dpad", "face_buttons", "housing", "centre"]
+# pairs whose separation witnesses the widening
+WIDTH_PAIR_ROLES = ("sticks", "triggers", "bumpers")
+
+# Relative importance of each role, used by cluster placement (c2) and
+# cluster sides (c4).  instruction.md is about the button clusters; the
+# stick/trigger/bumper pairs are already the subject of c1.  Equal weighting
+# would price skipping an entire button cluster at a 1/5 penalty.
+ROLE_WEIGHT = {
+    "dpad": 0.25,
+    "face_buttons": 0.25,
+    "sticks": 0.15,
+    "triggers": 0.15,
+    "bumpers": 0.15,
+    "centre": 0.05,
+}
+
+# Handedness evidence splits into two kinds that must NOT be averaged
+# together:
+#   POSITIVE witnesses say "the left-hand conversion was performed".
+#   GUARD witnesses say "...and it was not done by mirroring the whole part".
+# Averaged flat, a candidate that did nothing collects the guard weight for
+# inaction (never having mirrored the housing, it passes both guards).
+# Multiplying instead keeps the incentive pointing the right way: guards can
+# only REDUCE credit that positive evidence earned.
+HANDEDNESS_POSITIVE = {"cluster_sides": 0.6, "body_chirality": 0.4}
+# Guard weights. No single witness may exceed half, and that is the whole
+# point: when one dies the remainder still carries the guard at full strength
+# (weighted_evidence renormalises over what is readable), instead of the class
+# going wholly unreadable and falling back to NEUTRAL_UNVERIFIABLE -- which
+# paid a candidate MORE for destroying the evidence than for being caught.
+#: THE GUARD IS TWO WITNESSES, NOT THREE. `housing_detail_side` used to
+#: carry 0.3 here on the reasoning that a naive whole-part mirror drags the
+#: engraved labels across the plane with everything else. It does -- and so
+#: does a correct conversion, because instruction.md asks for the
+#: START/SELECT labels to "end up in mirrored positions". Measured on this
+#: corpus the naive-flip adversary reads +0.1901 and the reference +0.2025:
+#: the two the guard exists to separate are indistinguishable on it, while
+#: the only model it passed was the one that never converted the controller
+#: at all. Area balance cannot tell a relocated label from a mirrored one;
+#: only orientation can, and it does not measure orientation. It is still
+#: computed and reported -- see DETAIL_SIDE_IS_DIAGNOSTIC -- with no weight.
+HANDEDNESS_GUARD = {"port_lights_side": 0.7,
+                    "housing_side_signature": 0.3}
+# Fraction of positive credit a naive whole-part flip keeps.  Non-zero
+# because such a candidate did produce a left-handed layout; small because
+# instruction.md names this failure explicitly.
+GUARD_FLOOR = 0.15
+# Rigidity qualifies cluster placement rather than standing beside it: summed
+# 50/50 it awards 0.5 to a candidate that never moved a cluster (undeformed,
+# because untouched).  As a floored multiplier: placed and rigid = 1.0,
+# placed but deformed = 0.5, never placed = 0.
+RIGID_FLOOR = 0.5
+# Used when no witness of a kind can be read at all.  0.5 rather than 1.0:
+# "nothing could be checked" must not pay better than "checked and half
+# right", or destroying the evidence becomes a winning strategy.
+NEUTRAL_UNVERIFIABLE = 0.5
+
+#: Fraction of the seed's face-button engraving a candidate must keep for
+#: full marks on C_MARKINGS. Every model in this corpus that keeps its
+#: symbols keeps 50 of 50 faces and every model that does not keeps 0, so
+#: nothing in the data forces a particular value; 0.75 leaves room for a
+#: candidate that re-cuts the symbols with slightly different topology
+#: without leaving room for one that removes them.
+MARKINGS_FULL_FRACTION = 0.75
+
+# body-volume windows (m^3) used by role assignment
+BUTTON_VOL_MIN = 0.4e-6
+BUTTON_VOL_MAX = 5.0e-6
+PAIR_VOL_MIN = 5.0e-6
+DIAMOND_LINK_M = 0.035          # X-Z proximity that chains a button diamond
+HOUSING_FRACTION = 0.5          # of the largest body's volume
+SMALL_FACE_AREA = 15e-6         # arrow/glyph engraving faces (dpad witness)
+# Mean small-face count by which the two button diamonds must differ before
+# their identity counts as measured rather than guessed. The seed separates
+# them by 11.0 (d-pad arrows) against 0.0 (plain face buttons), so anything
+# from ~1 upwards is safely clear of measurement noise while still refusing
+# to call a dead heat.
+CLUSTER_ID_MIN_SEP = 1.0
+
+#: HOW DIFFERENT TWO BUTTON DIAMONDS MUST LOOK to be called different
+#: clusters, as the largest relative difference among (plan aspect, plan
+#: footprint, diamond radius).  Measured across this corpus: the seed's own
+#: two clusters are 0.337 apart, every correctly matched pair is within
+#: 0.014, every mismatched pair is at least 0.675, and the models that lost
+#: a cluster sit at exactly 0.000.  0.10 is 7x the worst match and 6.7x
+#: below the best mismatch.
+CLUSTER_SHAPE_MIN_SEP = 0.10
+
+# port-light glyph cluster constants
+LIGHT_FACE_MAX_AREA = 8e-6
+LIGHT_MIN_OFFPLANE_M = 0.040
+LIGHT_AREA_TOL_FRAC = 0.02
+LIGHT_CLUSTER_RADIUS_M = 0.020
+LIGHT_MIN_MATCHES = 3
+
+
+# --------------------------------------------------------------------------
+# scoring helpers
+# --------------------------------------------------------------------------
+
+def clamp01(v):
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v:                                  # NaN
+        return 0.0
+    return max(0.0, min(1.0, v))
+
+
+def mean_scores(values, default=1.0):
+    """Mean of per-item SCORES.
+
+    Never call this on per-item errors: averaging errors lets a +30 mm
+    mistake on one pair cancel a 0 mm mistake on another.
+    """
+    vals = [clamp01(v) for v in values]
+    return sum(vals) / len(vals) if vals else default
+
+
+def status_of(score, floor=1e-9):
+    if score >= 1.0 - floor:
+        return PASS
+    if score <= floor:
+        return FAIL
+    return PARTIAL
+
+
+def asymmetric_target_score(value_mm, target_mm, perfect_mm,
+                            zero_under_mm, zero_over_mm):
+    """Score a measurement against a target, penalising undershoot harder.
+
+    Symmetric |value - target| would give "did nothing" (0 mm) and "did it
+    twice over" (30 mm) the identical score, which collapses two genuinely
+    different candidates onto one number.  Overshoot demonstrates the
+    operation was understood and performed at the wrong magnitude;
+    undershoot to zero means it was never performed.
+    """
+    err = value_mm - target_mm
+    if abs(err) <= perfect_mm:
+        return 1.0
+    if err < 0:
+        return score_error(-err, perfect_mm, zero_under_mm)
+    return score_error(err, perfect_mm, zero_over_mm)
+
+
+def weighted_evidence(entries, neutral=NEUTRAL_UNVERIFIABLE):
+    """Weighted mean over readable witnesses only.
+
+    `entries` is {name: (weight, score_or_None)}; None means UNVERIFIABLE --
+    dropped from both numerator and denominator.  When nothing is readable
+    the caller gets `neutral`, never 1.0.
+
+    Returns (score, diagnostics) where diagnostics records how much of the
+    evidence weight actually survived, so a grade resting on one witness is
+    visibly different from one resting on all of them.
+    """
+    total_w = sum(w for w, _ in entries.values()) or 1.0
+    used = {k: (w, s) for k, (w, s) in entries.items() if s is not None}
+    verified_w = sum(w for w, _ in used.values())
+    frac = verified_w / total_w
+    if not used:
+        return neutral, {"verified_weight_fraction": 0.0,
+                         "readable": [], "unreadable": sorted(entries),
+                         "note": "no witness of this kind could be read; "
+                                 f"defaulted to the neutral {neutral}"}
+    if verified_w <= 0:
+        # Readable, but every readable witness carries zero weight -- a
+        # weighting choice, not a measurement. No opinion can be formed, so
+        # this is the same situation as nothing being readable at all.
+        return neutral, {"verified_weight_fraction": 0.0,
+                         "readable": sorted(used),
+                         "unreadable": sorted(k for k in entries
+                                              if k not in used),
+                         "note": "every readable witness of this kind is "
+                                 f"weighted zero; defaulted to {neutral}"}
+    score = sum(w * clamp01(s) for w, s in used.values()) / verified_w
+    return score, {
+        "verified_weight_fraction": round(frac, 3),
+        "readable": sorted(used),
+        "unreadable": sorted(k for k in entries if k not in used),
+    }
+
+
+def weighted_role_mean(scores_by_role, default=1.0):
+    """Mean of per-role scores weighted by ROLE_WEIGHT, renormalised over
+    whatever roles were actually measurable."""
+    items = [(ROLE_WEIGHT.get(r, 0.1), s) for r, s in scores_by_role.items()]
+    tot = sum(w for w, _ in items)
+    if not items or tot <= 0:
+        return default
+    return sum(w * clamp01(s) for w, s in items) / tot
+
+
+# --------------------------------------------------------------------------
+# role assignment (pure geometry)
+# --------------------------------------------------------------------------
+
+#: How far apart two pair-midpoints may be and still be called the same
+#: plane. Was implicit in `round(p * 1000)` plus a +-1.5 mm membership
+#: window, which are not the same number and disagreed at bucket edges.
+PLANE_WINDOW_MM = 1.5
+
+
+def sym_plane(bodies, expected=None):
+    """Mirror plane x from the mode of same-fingerprint pair midpoints.
+
+    DETERMINISTIC, WHICH IT WAS NOT. The old body was
+
+        buckets = Counter(round(p * 1000) for p in planes)
+        best = buckets.most_common(1)[0][0]
+
+    and `Counter.most_common` breaks ties by INSERTION ORDER. Insertion
+    order here is `itertools.combinations(bodies, 2)`, so it is the order
+    SolidWorks handed the bodies back -- which is not stable across
+    opens. Measured on 27.09: the same .SLDPRT captured twice in one
+    batch gave plane_x_m 0.13795 and 0.08059 (the part's real plane is
+    0.0805). Everything plane-relative is then measured about the wrong
+    mirror, and `clusters at mirrored positions` went 1.00 -> 0.00 --
+    1.5 of 7.0, on identical geometry, run to run.
+
+    Three changes, all of them about making the same input give the same
+    answer:
+
+      * each candidate plane is scored by HOW MANY midpoints fall within
+        PLANE_WINDOW_MM of it, not by how many share its 1 mm bucket. A
+        plane sitting on a bucket edge used to have its own support split
+        between two buckets and could lose to a spurious cluster.
+      * ties are broken by the value itself (and by distance to
+        `expected` when a baseline plane is known), never by the order
+        the pairs arrived in.
+      * `expected` only orders ties. It cannot invent a plane the
+        geometry does not support, so a part whose mirror genuinely
+        moved is still measured where it actually is.
+    """
+    planes = []
+    for a, b in itertools.combinations(bodies, 2):
+        if abs(a["volume_m3"] - b["volume_m3"]) > 1e-9:
+            continue
+        if abs(a["area_m2"] - b["area_m2"]) > 1e-7:
+            continue
+        ca, cb = a["centroid_m"], b["centroid_m"]
+        if abs(ca[1] - cb[1]) > 2e-3 or abs(ca[2] - cb[2]) > 2e-3:
+            continue
+        planes.append((ca[0] + cb[0]) / 2)
+    if not planes:
+        return None
+    planes.sort()
+    win = PLANE_WINDOW_MM / 1000.0
+
+    def support(p):
+        return sum(1 for q in planes if abs(q - p) <= win)
+
+    def rank(p):
+        # -support first; then nearest to the expected plane when one is
+        # known; then the value, so equal candidates always order the
+        # same way whatever order the pairs arrived in.
+        return (-support(p),
+                abs(p - expected) if expected is not None else 0.0,
+                p)
+
+    best = min(planes, key=rank)
+    members = [q for q in planes if abs(q - best) <= win]
+    return sum(members) / len(members)
+
+
+def _diamond_groups(small):
+    def near(a, b):
+        ca, cb = a["centroid_m"], b["centroid_m"]
+        return math.hypot(ca[0] - cb[0], ca[2] - cb[2]) < DIAMOND_LINK_M
+
+    groups, used = [], set()
+    for b in small:
+        if b["id"] in used:
+            continue
+        stack, comp = [b], []
+        used.add(b["id"])
+        while stack:
+            x = stack.pop()
+            comp.append(x)
+            for o in small:
+                if o["id"] not in used and near(x, o):
+                    used.add(o["id"])
+                    stack.append(o)
+        groups.append(comp)
+    return groups
+
+
+def _diamond_plan_shape(group):
+    """(mean plan aspect, mean plan footprint mm2) of a four-body diamond.
+
+    Plan, not volume: the reference rescales the buttons, and aspect and
+    footprint in the XZ plane are what survive that. A body without a
+    bounding box contributes an aspect of 1.0, which sorts it with the
+    round buttons rather than inventing an elongation for it.
+    """
+    asp, foot = [], []
+    for b in group:
+        bb = b.get("bbox_m")
+        if not bb or len(bb) < 6:
+            asp.append(1.0)
+            foot.append(0.0)
+            continue
+        dx, dz = abs(bb[3] - bb[0]) * MM, abs(bb[5] - bb[2]) * MM
+        lo, hi = sorted((dx, dz))
+        asp.append(hi / lo if lo > 0 else 1.0)
+        foot.append(dx * dz)
+    n = len(group) or 1
+    return (sum(asp) / n, sum(foot) / n)
+
+
+def assign_roles(bodies, small_face_count):
+    """{role: [ids]} from geometry alone."""
+    roles = {}
+
+    bysize = sorted(bodies, key=lambda b: -b["volume_m3"])
+    housing = [bysize[0]["id"]]
+    for b in bysize[1:]:
+        if b["volume_m3"] > HOUSING_FRACTION * bysize[0]["volume_m3"]:
+            housing.append(b["id"])
+    roles["housing"] = housing
+
+    small = [b for b in bodies
+             if BUTTON_VOL_MIN < b["volume_m3"] < BUTTON_VOL_MAX]
+    diamonds = [g for g in _diamond_groups(small) if len(g) == 4]
+    # THE D-PAD IS THE MORE ELONGATED DIAMOND, not the more engraved one.
+    #
+    # It used to be the one carrying more small engraved faces -- its arrows
+    # -- which is a property of the seed rather than of a controller, and it
+    # inverts the moment the round buttons are engraved. The grader
+    # re-decides a CANDIDATE's labels by plan shape and could afford to
+    # ignore this ordering, but the BASELINE is never re-resolved: Broles
+    # comes straight out of prompt/input.json and is what every candidate's
+    # clusters are positioned against. A seed frozen with its labels crossed
+    # would measure every candidate against the wrong cluster.
+    #
+    #     d-pad arm     plan 13.8 x 17.0 mm   aspect 1.23   footprint 234 mm2
+    #     round button  plan 18.8 x 18.8 mm   aspect 1.00   footprint 353 mm2
+    #
+    # A cross arm is a rectangle in plan; a round button's bounding box is
+    # square by construction. Neither depends on what is engraved on it.
+    #
+    # Engraving and x-centroid are kept BELOW the shape keys. When the two
+    # diamonds really are the same shape -- a candidate that dropped a copy
+    # of one cluster where the other belonged -- the shape keys tie and
+    # those still decide, so the capture stays reproducible instead of
+    # falling out of SolidWorks' body enumeration order, which is not
+    # stable. The grader does not trust a tied label either way; see
+    # Grader._resolve_button_clusters().
+    diamonds.sort(key=lambda g: (-round(_diamond_plan_shape(g)[0], 3),
+                                 round(_diamond_plan_shape(g)[1], 1),
+                                 -sum(small_face_count.get(b["id"], 0)
+                                      for b in g) / len(g),
+                                 sum(b["centroid_m"][0] for b in g) / len(g)))
+    if len(diamonds) >= 2:
+        roles["dpad"] = [b["id"] for b in diamonds[0]]
+        roles["face_buttons"] = [b["id"] for b in diamonds[1]]
+    elif len(diamonds) == 1:
+        roles["dpad"] = [b["id"] for b in diamonds[0]]
+        roles["face_buttons"] = []
+    else:
+        roles["dpad"], roles["face_buttons"] = [], []
+
+    diamond_ids = {b["id"] for g in diamonds for b in g}
+    roles["centre"] = [b["id"] for b in small if b["id"] not in diamond_ids]
+
+    taken = set(housing) | diamond_ids | set(roles["centre"])
+    mids = [b for b in bodies
+            if b["id"] not in taken and b["volume_m3"] >= PAIR_VOL_MIN]
+    pairs = []
+    for a, b in itertools.combinations(mids, 2):
+        if abs(a["volume_m3"] - b["volume_m3"]) > 1e-8:
+            continue
+        if abs(a["area_m2"] - b["area_m2"]) > 1e-6:
+            continue
+        if abs(a["centroid_m"][2] - b["centroid_m"][2]) > 3e-3:
+            continue
+        pairs.append((a, b))
+
+    def pz(p):
+        return (p[0]["centroid_m"][2] + p[1]["centroid_m"][2]) / 2
+
+    used = set()
+    if pairs:
+        st = max(pairs, key=pz)          # sticks sit highest (z)
+        roles["sticks"] = [st[0]["id"], st[1]["id"]]
+        used = set(roles["sticks"])
+        low = [p for p in pairs
+               if p[0]["id"] not in used and p[1]["id"] not in used]
+        low.sort(key=lambda p: -p[0]["volume_m3"])
+        if low:                          # larger low pair = triggers
+            roles["triggers"] = [low[0][0]["id"], low[0][1]["id"]]
+            used |= set(roles["triggers"])
+        if len(low) >= 2:
+            roles["bumpers"] = [low[1][0]["id"], low[1][1]["id"]]
+    return roles
+
+
+# --------------------------------------------------------------------------
+# capture helpers -- everything below knows about THIS part
+#
+# The task-agnostic half of capture lives in common/solidworks_capture.py
+# (session attach, document open, body capture, feature and modelling
+# census, glyph discovery). What stays here is what could only ever apply
+# to a controller: which body is a d-pad, where the port-light glyphs sit,
+# which pairs of controls may not interfere.
+# --------------------------------------------------------------------------
+
+def _small_face_counts(raw_bodies):
+    out = {}
+    for idx, b in enumerate(raw_bodies):
+        n = 0
+        for f in (z(b.GetFaces) or []):
+            try:
+                if float(z(f.GetArea)) < SMALL_FACE_AREA:
+                    n += 1
+            except Exception:
+                continue
+        out[f"c{idx:02d}"] = n
+    return out
+
+
+def housing_faces(raw_bodies, housing_ids):
+    """One pass over housing faces: (area, box-centre xyz) per face."""
+    out = []
+    for hid in housing_ids:
+        idx = int(hid[1:])
+        body = raw_bodies[idx]
+        for f in (z(body.GetFaces) or []):
+            try:
+                a = float(z(f.GetArea))
+                box = z(f.GetBox)
+                c = [(float(box[k]) + float(box[k + 3])) / 2 for k in range(3)]
+            except Exception:
+                continue
+            out.append((a, c))
+    return out
+
+
+def housing_signature(faces, plane_x):
+    """Area-weighted 3rd moment of housing face box-centres about x=plane.
+    Sign flips under a whole-part mirror."""
+    m3, area_total = 0.0, 0.0
+    for a, c in faces:
+        m3 += a * (c[0] - plane_x) ** 3
+        area_total += a
+    return {"moment3_m5": m3, "face_area_m2": area_total,
+            "faces": len(faces), "sign": 1 if m3 >= 0 else -1}
+
+
+def housing_detail_side(faces, plane_x):
+    """Which side of the plane the housing's ENGRAVED detail sits on.
+
+    housing_signature() above asks the same question over every housing
+    face, and that is exactly why it dies on real candidates: widening by
+    15 mm means re-shelling, a re-shell adds a great many large interior
+    faces, and their distribution swamps the exterior asymmetry. The moment
+    then measures the shell rather than the markings, its sign proves
+    nothing, and the check reports UNVERIFIABLE -- on every candidate that
+    actually did the work.
+
+    Filtering to faces below SMALL_FACE_AREA removes precisely the faces a
+    re-shell adds. What survives is engraving-scale detail -- glyphs, text,
+    moulded markings -- which is one-sided by nature and must stay where it
+    was. The statistic is an area-weighted left/right balance rather than a
+    moment: scale-free, bounded in [-1, 1], and not dominated by whichever
+    mark happens to sit furthest from the plane.
+
+    Faces inside the deadband have no meaningful side and are dropped, so a
+    marking centred on the plane cannot tip the result by rounding.
+    """
+    left = right = 0.0
+    n_left = n_right = 0
+    band = TOL["detail_deadband_mm"] / MM
+    for a, c in faces:
+        if a >= SMALL_FACE_AREA:
+            continue
+        d = c[0] - plane_x
+        if abs(d) < band:
+            continue
+        if d > 0:
+            right += a
+            n_right += 1
+        else:
+            left += a
+            n_left += 1
+    total = left + right
+    return {
+        "asymmetry": ((right - left) / total) if total > 0 else 0.0,
+        "area_right_m2": right, "area_left_m2": left,
+        "faces_right": n_right, "faces_left": n_left,
+        "max_face_area_m2": SMALL_FACE_AREA,
+        "deadband_mm": TOL["detail_deadband_mm"],
+    }
+
+
+def housing_halves(faces, plane_x):
+    """Where each half of the shell sits, as an offset from the plane.
+
+    instruction.md asks to widen the BODY by separating its two hand-grip
+    halves. c1 used to read that only through the controls (sticks,
+    triggers, bumpers), so a shell widened exactly 15 mm with its controls
+    left behind scored 0 on "widened by 15 mm". This is the shell's own
+    witness: the area-weighted mean X of the housing faces on each side of
+    the plane. Offsets, not absolute X, so a part whose origin moved is
+    read the same as one that did not.
+    """
+    band = TOL["halves_deadband_mm"] / MM
+    sums = {"left": [0.0, 0.0], "right": [0.0, 0.0]}
+    for a, c in faces:
+        d = c[0] - plane_x
+        if abs(d) < band:
+            continue
+        side = "right" if d > 0 else "left"
+        sums[side][0] += a * d
+        sums[side][1] += a
+    if not sums["left"][1] or not sums["right"][1]:
+        return None
+    left = sums["left"][0] / sums["left"][1]
+    right = sums["right"][0] / sums["right"][1]
+    return {"left_dx_m": left, "right_dx_m": right,
+            "separation_m": right - left,
+            "area_left_m2": sums["left"][1], "area_right_m2": sums["right"][1],
+            "deadband_mm": TOL["halves_deadband_mm"]}
+
+
+def dump_json(obj):
+    """json.dumps(indent=1), but a list of plain numbers stays on one line:
+    a schema /7 capture is mostly meshes, which one number per line would
+    double in size and spread over hundreds of thousands of lines."""
+    flat = []
+
+    def mark(o):
+        if isinstance(o, dict):
+            return {k: mark(v) for k, v in o.items()}
+        if isinstance(o, (list, tuple)):
+            if o and all(isinstance(v, (int, float))
+                         and not isinstance(v, bool) for v in o):
+                flat.append(json.dumps(list(o), separators=(",", ":")))
+                return "\x00%d\x00" % (len(flat) - 1)
+            return [mark(v) for v in o]
+        return o
+
+    import re
+    text = json.dumps(mark(obj), indent=1, default=str)
+    if text.count("\\u0000") != 2 * len(flat):
+        # a string of the capture itself holds a NUL: write it plainly
+        return json.dumps(obj, indent=1, default=str)
+    return re.sub(r'"\\u0000(\d+)\\u0000"', lambda m: flat[int(m.group(1))],
+                  text)
+
+
+SAMPLE_CELL_M = 0.003   # capture samples (`p`): triangles binned per 3 mm
+SKIN_CELL_MM = 1.5      # skin checks resample meshes (schema /7) this fine
+MESH_UNIT_MM = 0.01     # mesh vertices are stored as integers of this
+
+
+def _bin_split(tris, cell):
+    """bin_triangles(tris, cell, split=True) with facet normals: the same
+    arithmetic in the same order, unrolled (the skin checks run it on every
+    face of every capture)."""
+    sqrt, floor = math.sqrt, math.floor
+    nt = len(tris) // 9
+    c0 = c1 = c2 = 0.0; n0 = n1 = n2 = 0.0; a_tot = 0.0
+    buckets = {}
+    lim2 = cell * cell
+    for t in range(nt):
+        b = 9 * t
+        x0, y0, z0, x1, y1, z1, x2, y2, z2 = tris[b:b + 9]
+        u0, u1, u2 = x1 - x0, y1 - y0, z1 - z0
+        v0, v1, v2 = x2 - x0, y2 - y0, z2 - z0
+        cr0 = u1 * v2 - u2 * v1
+        cr1 = u2 * v0 - u0 * v2
+        cr2 = u0 * v1 - u1 * v0
+        a = 0.5 * sqrt(cr0 * cr0 + cr1 * cr1 + cr2 * cr2)
+        if a <= 0.0:
+            continue
+        t0, t1, t2 = cr0 / (2.0 * a), cr1 / (2.0 * a), cr2 / (2.0 * a)
+        a_tot += a
+        c0 += a * (x0 + x1 + x2) / 3.0
+        c1 += a * (y0 + y1 + y2) / 3.0
+        c2 += a * (z0 + z1 + z2) / 3.0
+        n0 += a * t0; n1 += a * t1; n2 += a * t2
+        stack = [((x0, y0, z0), (x1, y1, z1), (x2, y2, z2))]
+        pop, push = stack.pop, stack.append
+        while stack:
+            q0, q1, q2 = pop()
+            a0, a1, a2 = q0; b0, b1, b2 = q1; d0, d1, d2 = q2
+            e0 = (b0 - a0) ** 2 + (b1 - a1) ** 2 + (b2 - a2) ** 2
+            e1 = (d0 - b0) ** 2 + (d1 - b1) ** 2 + (d2 - b2) ** 2
+            e2 = (a0 - d0) ** 2 + (a1 - d1) ** 2 + (a2 - d2) ** 2
+            if e0 >= e1:
+                k, ek = (0, e0) if e0 >= e2 else (2, e2)
+            else:
+                k, ek = (1, e1) if e1 >= e2 else (2, e2)
+            if ek > lim2:
+                if k == 0:
+                    r0, r1, r2 = q0, q1, q2
+                elif k == 1:
+                    r0, r1, r2 = q1, q2, q0
+                else:
+                    r0, r1, r2 = q2, q0, q1
+                m = ((r0[0] + r1[0]) / 2.0, (r0[1] + r1[1]) / 2.0,
+                     (r0[2] + r1[2]) / 2.0)
+                push((r0, m, r2))
+                push((m, r1, r2))
+                continue
+            w00, w01, w02 = b0 - a0, b1 - a1, b2 - a2
+            w10, w11, w12 = d0 - a0, d1 - a1, d2 - a2
+            ar = 0.5 * sqrt((w01 * w12 - w02 * w11) ** 2
+                            + (w02 * w10 - w00 * w12) ** 2
+                            + (w00 * w11 - w01 * w10) ** 2)
+            g0 = (a0 + b0 + d0) / 3.0
+            g1 = (a1 + b1 + d1) / 3.0
+            g2 = (a2 + b2 + d2) / 3.0
+            key = (int(floor(g0 / cell)), int(floor(g1 / cell)),
+                   int(floor(g2 / cell)))
+            bk = buckets.get(key)
+            if bk is None:
+                bk = buckets[key] = [0.0] * 7
+            bk[0] += ar * g0; bk[4] += ar * t0
+            bk[1] += ar * g1; bk[5] += ar * t1
+            bk[2] += ar * g2; bk[6] += ar * t2
+            bk[3] += ar
+    if a_tot <= 0.0:
+        return None, None, []
+    c = [c0 / a_tot, c1 / a_tot, c2 / a_tot]
+    ln = sqrt(n0 * n0 + n1 * n1 + n2 * n2)
+    samples = []
+    for bk in buckets.values():
+        if bk[3] <= 0.0:
+            continue
+        bl = sqrt(bk[4] * bk[4] + bk[5] * bk[5] + bk[6] * bk[6]) or 1.0
+        samples.append([bk[0] / bk[3], bk[1] / bk[3], bk[2] / bk[3], bk[3],
+                        bk[4] / bl, bk[5] / bl, bk[6] / bl])
+    return c, ([n0 / ln, n1 / ln, n2 / ln] if ln > 0 else None), samples
+
+
+def bin_triangles(tris, cell, vnorms=None, split=False):
+    """Area-weighted centroid, mean normal and one surface sample per `cell`
+    cube [x, y, z, area, nx, ny, nz] from a flat list of triangles (9 floats
+    each, any length unit; areas come out in that unit squared).
+
+    `vnorms`, when given, holds SolidWorks' vertex normals in the same
+    layout; otherwise each triangle's own facet normal is used.
+
+    split=False bins whole triangles by their centroid (what schema /6
+    captured: a long sliver then stands for its whole area at one point).
+    split=True first cuts every triangle by longest-edge bisection until no
+    edge is longer than `cell`, so every cell the surface crosses gets a
+    sample and only its own share of the area; the work grows with area,
+    not with the square of a sliver's length."""
+    if split and vnorms is None:
+        return _bin_split(tris, cell)
+    nt = len(tris) // 9
+    c, n, a_tot = [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], 0.0
+    buckets = {}
+    lim2 = cell * cell
+    for t in range(nt):
+        p0 = tris[9 * t: 9 * t + 3]
+        p1 = tris[9 * t + 3: 9 * t + 6]
+        p2 = tris[9 * t + 6: 9 * t + 9]
+        u = [p1[i] - p0[i] for i in range(3)]
+        v = [p2[i] - p0[i] for i in range(3)]
+        cr = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2],
+              u[0] * v[1] - u[1] * v[0]]
+        a = 0.5 * math.sqrt(sum(x * x for x in cr))
+        if a <= 0.0:
+            continue
+        if vnorms is not None and len(vnorms) >= 9 * (t + 1):
+            tn = [sum(vnorms[9 * t + 3 * k + i] for k in range(3)) / 3.0
+                  for i in range(3)]
+        else:
+            tn = [x / (2.0 * a) for x in cr]
+        a_tot += a
+        for i in range(3):
+            c[i] += a * (p0[i] + p1[i] + p2[i]) / 3.0
+            n[i] += a * tn[i]
+        stack = [(p0, p1, p2)]
+        while stack:
+            q0, q1, q2 = stack.pop()
+            if split:
+                e = [sum((q1[i] - q0[i]) ** 2 for i in range(3)),
+                     sum((q2[i] - q1[i]) ** 2 for i in range(3)),
+                     sum((q0[i] - q2[i]) ** 2 for i in range(3))]
+                k = max(range(3), key=lambda j: e[j])
+                if e[k] > lim2:
+                    r0, r1, r2 = ((q0, q1, q2), (q1, q2, q0),
+                                  (q2, q0, q1))[k]
+                    m = [(r0[i] + r1[i]) / 2.0 for i in range(3)]
+                    stack.append((r0, m, r2))
+                    stack.append((m, r1, r2))
+                    continue
+                w0 = [q1[i] - q0[i] for i in range(3)]
+                w1 = [q2[i] - q0[i] for i in range(3)]
+                ar = 0.5 * math.sqrt(
+                    (w0[1] * w1[2] - w0[2] * w1[1]) ** 2
+                    + (w0[2] * w1[0] - w0[0] * w1[2]) ** 2
+                    + (w0[0] * w1[1] - w0[1] * w1[0]) ** 2)
+            else:
+                ar = a
+            g = [(q0[i] + q1[i] + q2[i]) / 3.0 for i in range(3)]
+            key = (int(math.floor(g[0] / cell)), int(math.floor(g[1] / cell)),
+                   int(math.floor(g[2] / cell)))
+            bk = buckets.get(key)
+            if bk is None:
+                bk = buckets[key] = [0.0] * 7
+            for i in range(3):
+                bk[i] += ar * g[i]
+                bk[4 + i] += ar * tn[i]
+            bk[3] += ar
+    if a_tot <= 0.0:
+        return None, None, []
+    c = [x / a_tot for x in c]
+    ln = math.sqrt(sum(x * x for x in n))
+    samples = []
+    for bk in buckets.values():
+        if bk[3] <= 0.0:
+            continue
+        bl = math.sqrt(sum(x * x for x in bk[4:7])) or 1.0
+        samples.append([bk[0] / bk[3], bk[1] / bk[3], bk[2] / bk[3], bk[3]]
+                       + [x / bl for x in bk[4:7]])
+    return c, ([x / ln for x in n] if ln > 0 else None), samples
+
+
+def _face_tris(face):
+    """SolidWorks' own tessellation of one face (metres, 9 floats per
+    triangle) and its vertex normals, or ([], [])."""
+    try:
+        tri = list(face.GetTessTriangles(True) or [])
+    except Exception:
+        tri = []
+    try:
+        nrm = list(z(face.GetTessNorms) or [])
+    except Exception:
+        nrm = []
+    return tri, nrm
+
+
+def mesh_record(tris):
+    """A triangle list (metres) as a compact indexed mesh: `mv` vertex
+    coordinates as integers of MESH_UNIT_MM, shared vertices stored once,
+    and `mt` three vertex indices per triangle."""
+    q = MM / MESH_UNIT_MM
+    index, mv, mt = {}, [], []
+    for j in range(len(tris) // 3):
+        key = (int(round(tris[3 * j] * q)), int(round(tris[3 * j + 1] * q)),
+               int(round(tris[3 * j + 2] * q)))
+        k = index.get(key)
+        if k is None:
+            k = index[key] = len(index)
+            mv.extend(key)
+        mt.append(k)
+    return {"mv": mv, "mt": mt}
+
+
+def mesh_triangles_mm(rec):
+    """Inverse of mesh_record: the flat triangle list, in millimetres."""
+    mv, out = rec.get("mv") or [], []
+    for k in rec.get("mt") or []:
+        out.extend((mv[3 * k] * MESH_UNIT_MM, mv[3 * k + 1] * MESH_UNIT_MM,
+                    mv[3 * k + 2] * MESH_UNIT_MM))
+    return out
+
+
+def housing_face_list(raw_bodies, housing_ids):
+    """Every housing face, one record each, for the c5 skin checks and the
+    c3 seated-controls check. Millimetres, rounded, so the capture stays
+    small: a (area mm2), c (centroid), n (outward normal), b (box), s
+    (surface: plane / cyl / cone / other), cyl (origin, axis, radius), cone
+    (origin, axis, radius, half-angle), p (one surface sample per 3 mm cell:
+    x, y, z mm, the area mm2 it stands for, and the local outward normal),
+    and, from schema /7, the face's full tessellation as mv / mt (see
+    mesh_record)."""
+    out = []
+    for hid in housing_ids:
+        body = raw_bodies[int(hid[1:])]
+        for f in (z(body.GetFaces) or []):
+            try:
+                a = float(z(f.GetArea))
+                box = [float(v) for v in z(f.GetBox)]
+            except Exception:
+                continue
+            tri, nrm = _face_tris(f)
+            c, n, smp = bin_triangles(tri, SAMPLE_CELL_M, nrm)
+            if c is None:
+                c = [(box[k] + box[k + 3]) / 2 for k in range(3)]
+            rec = {"body": hid, "a": round(a * 1e6, 4),
+                   "c": [round(v * MM, 3) for v in c],
+                   "n": [round(v, 4) for v in n] if n else None,
+                   "b": [round(v * MM, 3) for v in box], "s": "other",
+                   "p": [[round(q[0] * MM, 2), round(q[1] * MM, 2),
+                          round(q[2] * MM, 2), round(q[3] * 1e6, 3),
+                          round(q[4], 3), round(q[5], 3), round(q[6], 3)]
+                         for q in smp]}
+            rec.update(mesh_record(tri))
+            try:
+                surf = z(f.GetSurface)
+                if z(surf.IsPlane):
+                    rec["s"] = "plane"
+                elif z(surf.IsCylinder):
+                    rec["s"] = "cyl"
+                    cp = [float(v) for v in z(surf.CylinderParams)]
+                    rec["cyl"] = ([round(v * MM, 3) for v in cp[0:3]]
+                                  + [round(v, 5) for v in cp[3:6]]
+                                  + [round(cp[6] * MM, 4)])
+                elif z(surf.IsCone):
+                    rec["s"] = "cone"
+                    cp = [float(v) for v in z(surf.ConeParams)]
+                    rec["cone"] = ([round(v * MM, 3) for v in cp[0:3]]
+                                   + [round(v, 5) for v in cp[3:6]]
+                                   + [round(cp[6] * MM, 4), round(cp[7], 5)])
+            except Exception:
+                pass
+            out.append(rec)
+    return out
+
+
+def control_meshes(raw_bodies, roles):
+    """Full tessellation of every control body (not the housing), keyed by
+    body id, for the c3 clearance check: {id: {mv, mt}} as mesh_record."""
+    out = {}
+    for role, ids in roles.items():
+        if role == "housing":
+            continue
+        for bid in ids:
+            tri = []
+            try:
+                for f in (z(raw_bodies[int(bid[1:])].GetFaces) or []):
+                    tri.extend(_face_tris(f)[0])
+            except Exception:
+                tri = []   # recorded empty: the check reports it unchecked
+            out[bid] = mesh_record(tri)
+    return out
+
+
+def find_light_cluster_seed(faces, plane_x, bbox):
+    """Seed-side identification: tiny faces on the top-rear edge, well off
+    the mirror plane."""
+    y_top = bbox[4]          # y max
+    z_rear = bbox[2]         # z min
+    cand = [(a, c) for a, c in faces
+            if a < LIGHT_FACE_MAX_AREA
+            and abs(c[0] - plane_x) > LIGHT_MIN_OFFPLANE_M
+            and (y_top - c[1]) < 0.030
+            and (c[2] - z_rear) < 0.020]
+    if len(cand) < LIGHT_MIN_MATCHES:
+        return None
+    best = None
+    for a0, c0 in cand:
+        grp = [(a, c) for a, c in cand
+               if math.hypot(c[0] - c0[0], c[2] - c0[2])
+               < LIGHT_CLUSTER_RADIUS_M]
+        if best is None or len(grp) > len(best):
+            best = grp
+    if not best or len(best) < LIGHT_MIN_MATCHES:
+        return None
+    cx = sum(c[0] for _, c in best) / len(best)
+    return {
+        "areas_m2": sorted(a for a, _ in best),
+        "centroid_m": [sum(c[k] for _, c in best) / len(best)
+                       for k in range(3)],
+        "side": 1 if cx >= plane_x else -1,
+        "n_faces": len(best),
+    }
+
+
+def find_light_cluster_candidate(faces, plane_x, seed_cluster):
+    """Candidate-side: match the seed's area multiset among housing faces."""
+    if not seed_cluster:
+        return None
+    hits = []
+    for want in seed_cluster["areas_m2"]:
+        best, bd = None, None
+        for a, c in faces:
+            d = abs(a - want) / max(want, 1e-30)
+            if d < LIGHT_AREA_TOL_FRAC and (bd is None or d < bd):
+                best, bd = (a, c), d
+        if best:
+            hits.append(best)
+    if len(hits) < LIGHT_MIN_MATCHES:
+        return None
+    best = None
+    for a0, c0 in hits:
+        grp = [(a, c) for a, c in hits
+               if math.hypot(c[0] - c0[0], c[2] - c0[2])
+               < LIGHT_CLUSTER_RADIUS_M]
+        if best is None or len(grp) > len(best):
+            best = grp
+    if not best or len(best) < LIGHT_MIN_MATCHES:
+        return None
+    cx = sum(c[0] for _, c in best) / len(best)
+    return {
+        "areas_m2": sorted(a for a, _ in best),
+        "centroid_m": [sum(c[k] for _, c in best) / len(best)
+                       for k in range(3)],
+        "side": 1 if cx >= plane_x else -1,
+        "n_faces": len(best),
+    }
+
+
+def control_interference(raw_bodies, bodies, roles):
+    """Boolean-intersect interference among control bodies and each control
+    vs housing."""
+    control_ids = []
+    for role in ("dpad", "face_buttons", "sticks", "triggers", "bumpers",
+                 "centre"):
+        control_ids.extend(roles.get(role, []))
+    housing_ids = roles.get("housing", [])
+
+    idx_of = {b["id"]: i for i, b in enumerate(bodies)}
+    test_pairs = []
+    for a, b in itertools.combinations(control_ids, 2):
+        test_pairs.append((a, b))
+    for a in control_ids:
+        for h in housing_ids:
+            test_pairs.append((a, h))
+
+    boxes = {bid: bodies[idx_of[bid]]["bbox_m"]
+             for bid in set(control_ids) | set(housing_ids)}
+    pairs, total, failures = [], 0.0, 0
+    for a, b in test_pairs:
+        if not M._boxes_overlap(boxes[a], boxes[b], M.BBOX_PAD):
+            continue
+        try:
+            copy_a = z(raw_bodies[int(a[1:])].Copy)
+            copy_b = z(raw_bodies[int(b[1:])].Copy)
+            res, code = M._operations2(copy_a, copy_b)
+            vol = 0.0
+            if res:
+                for rb in res:
+                    try:
+                        vol += float(rb.GetMassProperties(0.0)[3])
+                    except Exception:
+                        pass
+            if vol > M.MIN_INTERFERENCE_VOLUME or code != 0:
+                total += vol
+                if code != 0:
+                    failures += 1
+                pairs.append({"a": a, "b": b, "volume_m3": vol,
+                              "error_code": code})
+        except Exception:
+            failures += 1
+            pairs.append({"a": a, "b": b, "volume_m3": 0.0,
+                          "error_code": -1})
+    return {"tested_pairs": len(test_pairs), "pairs": pairs,
+            "total_volume_m3": total, "boolean_failures": failures}
+
+
+def role_bboxes(bodies, roles):
+    """Union bounding box per role, in metres.
+
+    Costs nothing extra -- per-body boxes are already collected.  A role's own
+    span is a far more specific witness of a resize than the global bounding
+    box of every body, which is dominated by whichever control happens to
+    stick out furthest.
+    """
+    by_id = {b["id"]: b for b in bodies}
+    out = {}
+    for role, ids in (roles or {}).items():
+        boxes = [by_id[i]["bbox_m"] for i in ids if i in by_id]
+        if not boxes:
+            continue
+        out[role] = ([min(b[k] for b in boxes) for k in range(3)]
+                     + [max(b[k + 3] for b in boxes) for k in range(3)])
+    return out
+
+
+def capture(doc, baseline=None, plane_x=None):
+    rebuild = SC.health_gate(doc, baseline)
+    raw, bodies, boxes, gmin, gmax = SC.capture_bodies(doc)
+    smf = _small_face_counts(raw)
+    roles = assign_roles(bodies, smf)
+
+    # The candidate's OWN symmetry plane is preferred over the baseline's.
+    #
+    # Everything plane-relative -- the housing moment, which side the
+    # port-light glyphs sit on -- is meaningless if measured about a plane the
+    # part no longer has. Translating the whole part is a legitimate edit (an
+    # author may reset the origin), so the plane must follow the part rather
+    # than the part being judged against a stale plane. Grader then normalises
+    # the offset so positions stay comparable with the baseline.
+    #
+    # Sanity-checked before use: a plane outside the part's own X extent is a
+    # mis-detection, not a translation, and the baseline is used instead.
+    # The baseline's plane, carried forward by however far the part has
+    # been translated. A legitimate edit may reset the origin, so the
+    # plane is allowed to travel WITH the part -- what it may not do is
+    # wander inside a part that has not moved.
+    expected_plane = None
+    bbb = ((baseline or {}).get("global") or {}).get("bbox_m")
+    if baseline and baseline.get("plane_x_m") is not None:
+        expected_plane = baseline["plane_x_m"]
+        if bbb and len(bbb) >= 4:
+            shift = ((gmin[0] + gmax[0]) / 2.0
+                     - (float(bbb[0]) + float(bbb[3])) / 2.0)
+            expected_plane += shift
+    measured_plane = sym_plane(bodies, expected=expected_plane)
+
+    # SANITY, AND THE OLD ONE WAS NOT ONE. "inside the part's own X
+    # extent" accepted 137.95 mm on a part 323 mm wide -- every
+    # mis-detection this task has ever produced passes that test. A plane
+    # that has slipped is one that sits far from where the seed's plane
+    # travelled to, on a part whose bounding box says it did not travel
+    # that far.
+    usable = (measured_plane is not None
+              and gmin[0] <= measured_plane <= gmax[0])
+    plane_slip_mm = None
+    if usable and expected_plane is not None:
+        plane_slip_mm = (measured_plane - expected_plane) * MM
+        if abs(plane_slip_mm) > PLANE_SLIP_MAX_MM:
+            usable = False
+    P = plane_x if plane_x is not None else None
+    plane_source = "argument"
+    if P is None:
+        if usable:
+            P, plane_source = measured_plane, "measured"
+        elif baseline and baseline.get("plane_x_m") is not None:
+            P, plane_source = baseline["plane_x_m"], "baseline"
+            if measured_plane is not None:
+                plane_source = (
+                    f"baseline (measured plane slipped "
+                    f"{plane_slip_mm:+.1f} mm from the seed's, "
+                    f"past the {PLANE_SLIP_MAX_MM:.0f} mm limit)"
+                    if plane_slip_mm is not None
+                    and abs(plane_slip_mm) > PLANE_SLIP_MAX_MM
+                    else "baseline (measured plane outside part extent)")
+        else:
+            plane_source = "undetermined"
+
+    hfaces = housing_faces(raw, roles.get("housing", []))
+    if P is not None:
+        sig = housing_signature(hfaces, P)
+        detail = housing_detail_side(hfaces, P)
+        halves = housing_halves(hfaces, P)
+        seed_cluster = (baseline or {}).get("light_cluster")
+        if seed_cluster:
+            lights = find_light_cluster_candidate(hfaces, P, seed_cluster)
+        else:
+            lights = find_light_cluster_seed(hfaces, P, gmin + gmax)
+    else:
+        sig = {"moment3_m5": 0.0, "sign": 0, "faces": 0}
+        detail = None
+        halves = None
+        lights = None
+
+    intf = control_interference(raw, bodies, roles)
+    return {
+        "schema": CAPTURE_SCHEMA,
+        "harness_version": HARNESS_VERSION,
+        "document": str(z(doc.GetTitle)),
+        "rebuild": rebuild,
+        "modelling": SC.modelling_census(doc),
+        "global": {"bbox_m": gmin + gmax,
+                   "width_m": gmax[0] - gmin[0]},
+        "plane_x_m": P,
+        "plane_x_measured_m": measured_plane,
+        "plane_source": plane_source,
+        "bodies": bodies,
+        "roles": roles,
+        "role_bbox_m": role_bboxes(bodies, roles),
+        "small_face_counts": smf,
+        "housing_signature": sig,
+        "housing_detail": detail,
+        "housing_halves": halves,
+        "light_cluster": lights,
+        "interference": intf,
+        "housing_faces": housing_face_list(raw, roles.get("housing", [])),
+        "control_meshes": control_meshes(raw, roles),
+    }
+
+
+# --------------------------------------------------------------------------
+# small helpers
+# --------------------------------------------------------------------------
+
+def d3(a, b):
+    return math.sqrt(sum((u - v) ** 2 for u, v in zip(a, b)))
+
+
+def sgn(v):
+    return 1.0 if v >= 0 else -1.0
+
+
+def fingerprint(b):
+    I = b["inertia_com"]
+    return [b["volume_m3"], b["area_m2"]] + sorted(
+        [I["Ixx"], I["Iyy"], I["Izz"]])
+
+
+def fp_distance(a, b):
+    s = 0.0
+    fa, fb = fingerprint(a), fingerprint(b)
+    for u, v in zip(fa, fb):
+        sc = max(abs(u), abs(v), 1e-30)
+        s += ((u - v) / sc) ** 2
+    return math.sqrt(s / len(fa))
+
+
+def chirality(b):
+    I = b["inertia_com"]
+    diag = max(abs(I["Ixx"]), abs(I["Iyy"]), abs(I["Izz"]))
+    return 0.0 if diag <= 0 else max(abs(I["Ixy"]), abs(I["Izx"])) / diag
+
+
+def chirality_witness(b):
+    I = b["inertia_com"]
+    return "Ixy" if abs(I["Ixy"]) >= abs(I["Izx"]) else "Izx"
+
+
+def mirror_x(x, plane):
+    """Reflect x about the plane -- no widening."""
+    return 2 * plane - x
+
+
+def mirror_widen_x(x, plane, half_m):
+    """Reflect about the plane AND push outward by `half_m` metres."""
+    o = x - plane
+    return plane - sgn(o) * (abs(o) + half_m)
+
+
+# --------------------------------------------------------------------------
+# grader
+# --------------------------------------------------------------------------
+
+def normalise_plane_offset(baseline, measured):
+    """Shift the candidate's X coordinates so both parts share a plane.
+
+    A part translated bodily along X is still a valid answer -- the author may
+    have reset the origin -- but every position comparison against the
+    baseline would read as a gross error. Sliding the candidate by the
+    difference between the two symmetry planes removes the rigid offset and
+    leaves every relative measurement untouched.
+
+    Quantities already computed about the candidate's own plane (the housing
+    moment, the port-light side) are unaffected: capture() measured them
+    against the plane the part actually has.
+
+    Returns (measured, offset_m). The input is not mutated.
+    """
+    pb = baseline.get("plane_x_m")
+    pc = measured.get("plane_x_m")
+    if pb is None or pc is None:
+        return measured, 0.0
+    dx = pb - pc
+    if abs(dx) * MM < TOL["plane_shift_ignore_mm"]:
+        return measured, 0.0
+
+    out = dict(measured)
+    out["bodies"] = []
+    for b in measured.get("bodies", []):
+        nb = dict(b)
+        nb["centroid_m"] = [b["centroid_m"][0] + dx] + list(b["centroid_m"][1:])
+        bb = list(b.get("bbox_m") or [])
+        if len(bb) == 6:
+            bb[0] += dx
+            bb[3] += dx
+            nb["bbox_m"] = bb
+        out["bodies"].append(nb)
+
+    g = dict(measured.get("global") or {})
+    gb = list(g.get("bbox_m") or [])
+    if len(gb) == 6:
+        gb[0] += dx
+        gb[3] += dx
+        g["bbox_m"] = gb
+        out["global"] = g
+
+    rb = {}
+    for role, box in (measured.get("role_bbox_m") or {}).items():
+        nbx = list(box)
+        nbx[0] += dx
+        nbx[3] += dx
+        rb[role] = nbx
+    if rb:
+        out["role_bbox_m"] = rb
+
+    lc = measured.get("light_cluster")
+    if lc and lc.get("centroid_m"):
+        nlc = dict(lc)
+        nlc["centroid_m"] = [lc["centroid_m"][0] + dx] + \
+            list(lc["centroid_m"][1:])
+        out["light_cluster"] = nlc
+
+    out["plane_x_m"] = pb
+    out["plane_normalised_by_mm"] = round(dx * MM, 3)
+    return out, dx
+
+
+def ungradable_reason(baseline, measured):
+    """Why this candidate cannot be measured at all, or None.
+
+    Distinct from "the candidate did badly". A part that scores zero on every
+    criterion has been measured and found wrong; a part that lands here could
+    not be measured, so no score is meaningful. Both end at 0, but only the
+    second is reported as ungradable, and the reason travels in the envelope
+    instead of a traceback.
+    """
+    if measured.get("open_error"):
+        return f"document could not be opened: {measured['open_error']}"
+    if not measured.get("bodies"):
+        return "part contains no solid bodies"
+    if measured.get("plane_x_m") is None:
+        return ("mirror plane could not be determined, from the part or from "
+                "the baseline -- every side and position judgement depends "
+                "on it")
+    return None
+
+
+def mesh_tris3_mm(rec):
+    """A mesh record as a list of triangles, each three (x, y, z) mm."""
+    f = mesh_triangles_mm(rec)
+    return [((f[i], f[i + 1], f[i + 2]), (f[i + 3], f[i + 4], f[i + 5]),
+             (f[i + 6], f[i + 7], f[i + 8])) for i in range(0, len(f), 9)]
+
+
+def _tri_dist2(p, a, b, c):
+    """Squared distance from point p to triangle abc (Ericson, 5.1.5)."""
+    ab = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+    ac = (c[0] - a[0], c[1] - a[1], c[2] - a[2])
+    ap = (p[0] - a[0], p[1] - a[1], p[2] - a[2])
+    d1 = ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2]
+    d2 = ac[0] * ap[0] + ac[1] * ap[1] + ac[2] * ap[2]
+    if d1 <= 0.0 and d2 <= 0.0:
+        q = a
+    else:
+        bp = (p[0] - b[0], p[1] - b[1], p[2] - b[2])
+        d3 = ab[0] * bp[0] + ab[1] * bp[1] + ab[2] * bp[2]
+        d4 = ac[0] * bp[0] + ac[1] * bp[1] + ac[2] * bp[2]
+        cp = (p[0] - c[0], p[1] - c[1], p[2] - c[2])
+        d5 = ab[0] * cp[0] + ab[1] * cp[1] + ab[2] * cp[2]
+        d6 = ac[0] * cp[0] + ac[1] * cp[1] + ac[2] * cp[2]
+        vc = d1 * d4 - d3 * d2
+        vb = d5 * d2 - d1 * d6
+        va = d3 * d6 - d5 * d4
+        if d3 >= 0.0 and d4 <= d3:
+            q = b
+        elif d6 >= 0.0 and d5 <= d6:
+            q = c
+        elif vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+            v = d1 / (d1 - d3)
+            q = (a[0] + v * ab[0], a[1] + v * ab[1], a[2] + v * ab[2])
+        elif vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+            w = d2 / (d2 - d6)
+            q = (a[0] + w * ac[0], a[1] + w * ac[1], a[2] + w * ac[2])
+        elif va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+            w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+            q = (b[0] + w * (c[0] - b[0]), b[1] + w * (c[1] - b[1]),
+                 b[2] + w * (c[2] - b[2]))
+        else:
+            den = 1.0 / (va + vb + vc)
+            v, w = vb * den, vc * den
+            q = (a[0] + ab[0] * v + ac[0] * w, a[1] + ab[1] * v + ac[1] * w,
+                 a[2] + ab[2] * v + ac[2] * w)
+    return ((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 + (p[2] - q[2]) ** 2)
+
+
+
+def _clusters(pts, link2):
+    """Groups of records whose points (record[0]) chain within sqrt(link2)
+    of each other."""
+    c = math.sqrt(link2) or 1.0
+    grid = {}
+    for i, r in enumerate(pts):
+        grid.setdefault(tuple(int(math.floor(v / c)) for v in r[0]),
+                        []).append(i)
+    seen, out = set(), []
+    for i in range(len(pts)):
+        if i in seen:
+            continue
+        seen.add(i)
+        stack, comp = [i], []
+        while stack:
+            j = stack.pop()
+            comp.append(pts[j])
+            pj = pts[j][0]
+            k = tuple(int(math.floor(v / c)) for v in pj)
+            for a in (-1, 0, 1):
+                for b in (-1, 0, 1):
+                    for d in (-1, 0, 1):
+                        for m in grid.get((k[0] + a, k[1] + b, k[2] + d), ()):
+                            if m not in seen:
+                                pm = pts[m][0]
+                                if ((pj[0] - pm[0]) ** 2 + (pj[1] - pm[1]) ** 2
+                                        + (pj[2] - pm[2]) ** 2) <= link2:
+                                    seen.add(m)
+                                    stack.append(m)
+        out.append(comp)
+    return out
+
+class SkinMesh:
+    """A candidate's housing tessellation, in mm, for exact point-on-skin
+    questions: is there surface facing the same way within `tol` of a
+    point? Triangles are cut to at most `edge` mm and filed in a grid by
+    their box, so a query reads only the few triangles around it."""
+
+    def __init__(self, faces, dx=0.0, tol=0.3, edge=3.0):
+        self.cell, self.tol = edge, tol
+        self.grid = {}
+        lim2, cell, floor = edge * edge, edge, math.floor
+        for f in faces:
+            for t in mesh_tris3_mm(f):
+                t = tuple((q[0] + dx, q[1], q[2]) for q in t)
+                stack = [t]
+                while stack:
+                    q0, q1, q2 = stack.pop()
+                    e = [sum((q1[i] - q0[i]) ** 2 for i in range(3)),
+                         sum((q2[i] - q1[i]) ** 2 for i in range(3)),
+                         sum((q0[i] - q2[i]) ** 2 for i in range(3))]
+                    k = max(range(3), key=lambda j: e[j])
+                    if e[k] > lim2:
+                        r0, r1, r2 = ((q0, q1, q2), (q1, q2, q0),
+                                      (q2, q0, q1))[k]
+                        m = tuple((r0[i] + r1[i]) / 2.0 for i in range(3))
+                        stack.append((r0, m, r2))
+                        stack.append((m, r1, r2))
+                        continue
+                    u = [q1[i] - q0[i] for i in range(3)]
+                    v = [q2[i] - q0[i] for i in range(3)]
+                    cr = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2],
+                          u[0] * v[1] - u[1] * v[0])
+                    ln = math.sqrt(sum(x * x for x in cr))
+                    if ln <= 0.0:
+                        continue
+                    rec = (q0, q1, q2, (cr[0] / ln, cr[1] / ln, cr[2] / ln))
+                    lo = [int(floor((min(q0[i], q1[i], q2[i]) - tol) / cell))
+                          for i in range(3)]
+                    hi = [int(floor((max(q0[i], q1[i], q2[i]) + tol) / cell))
+                          for i in range(3)]
+                    for x in range(lo[0], hi[0] + 1):
+                        for y in range(lo[1], hi[1] + 1):
+                            for z in range(lo[2], hi[2] + 1):
+                                self.grid.setdefault((x, y, z), []).append(rec)
+
+    def on(self, p, n, ndot):
+        """Surface facing within ndot of n lies within tol of p."""
+        c, tol = self.cell, self.tol
+        lst = self.grid.get((int(math.floor(p[0] / c)),
+                             int(math.floor(p[1] / c)),
+                             int(math.floor(p[2] / c))))
+        if not lst:
+            return False
+        t2 = tol * tol
+        for a, b, cc, tn in lst:
+            if tn[0] * n[0] + tn[1] * n[1] + tn[2] * n[2] < ndot:
+                continue
+            d = ((p[0] - a[0]) * tn[0] + (p[1] - a[1]) * tn[1]
+                 + (p[2] - a[2]) * tn[2])
+            if d > tol or d < -tol:
+                continue
+            if _tri_dist2(p, a, b, cc) <= t2:
+                return True
+        return False
+
+
+def section_xz(tris, y):
+    """The horizontal section of a triangle mesh at height y: a list of 2D
+    segments ((x, z), (x, z))."""
+    segs = []
+    for t in tris:
+        if min(q[1] for q in t) > y or max(q[1] for q in t) < y:
+            continue
+        pts = []
+        for i in range(3):
+            a, b = t[i], t[(i + 1) % 3]
+            if (a[1] - y) * (b[1] - y) < 0 or (a[1] == y and b[1] != y):
+                s = (y - a[1]) / (b[1] - a[1])
+                pts.append((a[0] + s * (b[0] - a[0]),
+                            a[2] + s * (b[2] - a[2])))
+        if len(pts) >= 2:
+            segs.append((pts[0], pts[1]))
+    return segs
+
+
+def _ray_hits(segs, o, d):
+    """Distances along the 2D ray o + t*d (t > 0) at which it crosses
+    `segs`."""
+    out = []
+    for p, q in segs:
+        ex, ez = q[0] - p[0], q[1] - p[1]
+        den = d[0] * ez - d[1] * ex
+        if abs(den) < 1e-12:
+            continue
+        wx, wz = p[0] - o[0], p[1] - o[1]
+        t = (wx * ez - wz * ex) / den
+        s = (wx * d[1] - wz * d[0]) / den
+        if t > 0 and 0 <= s <= 1:
+            out.append(t)
+    return out
+
+
+def control_gaps(ctris, htris, mirrors=(False,)):
+    """The clearance between one control and the housing around it, ray by
+    ray: horizontal sections through the control every gap_level_mm, and
+    from the control's centre (its box centre, so no frame is needed) one
+    ray every 360/gap_rays degrees. On each section and ray the gap is the
+    housing crossing nearest to the control's outermost crossing (negative
+    when the housing is inside the outline); a ray keeps its tightest gap
+    over all sections. One list of gaps per entry of `mirrors`; True flips
+    the rays in X, for a control the candidate mirrored. A ray with no
+    housing within gap_reach_mm is None."""
+    if not ctris:
+        return None
+    xs = [q[0] for t in ctris for q in t]
+    ys = [q[1] for t in ctris for q in t]
+    zs = [q[2] for t in ctris for q in t]
+    cx, cz = (min(xs) + max(xs)) / 2, (min(zs) + max(zs)) / 2
+    reach = TOL["gap_reach_mm"]
+    lim = max(max(xs) - min(xs), max(zs) - min(zs)) / 2 + reach + 2.0
+    n_rays, step = TOL["gap_rays"], TOL["gap_level_mm"]
+    y0, y1 = min(ys), max(ys)
+    n_lv = int((y1 - y0) / step)
+    # half a mesh unit off the vertex grid, so no section plane passes
+    # exactly through a vertex (an edge lying in the plane would drop out)
+    off = MESH_UNIT_MM / 2
+
+    def by_level(tris):
+        bins = {}
+        for t in tris:
+            lo = max(1, math.ceil((min(q[1] for q in t) - y0 - off) / step))
+            hi = min(n_lv - 1,
+                     math.floor((max(q[1] for q in t) - y0 - off) / step))
+            for k in range(lo, hi + 1):
+                bins.setdefault(k, []).append(t)
+        return bins
+
+    near = [t for t in htris
+            if min(q[0] for q in t) <= cx + lim
+            and max(q[0] for q in t) >= cx - lim
+            and min(q[2] for q in t) <= cz + lim
+            and max(q[2] for q in t) >= cz - lim
+            and max(q[1] for q in t) >= y0 and min(q[1] for q in t) <= y1]
+    cb, hb = by_level(ctris), by_level(near)
+    sets = []
+    for mir in mirrors:
+        sets.append([(math.cos(2 * math.pi * i / n_rays) * (-1 if mir else 1),
+                      math.sin(2 * math.pi * i / n_rays))
+                     for i in range(n_rays)])
+    best = [[None] * n_rays for _ in mirrors]
+    for k in range(1, n_lv):
+        if k not in cb or k not in hb:
+            continue
+        y = y0 + k * step + off
+        cs, hs = section_xz(cb[k], y), section_xz(hb[k], y)
+        if not cs or not hs:
+            continue
+        for m, dirs in enumerate(sets):
+            for i, d in enumerate(dirs):
+                ch = _ray_hits(cs, (cx, cz), d)
+                if not ch:
+                    continue
+                rc = max(ch)
+                hh = [t for t in _ray_hits(hs, (cx, cz), d)
+                      if rc - TOL["gap_back_mm"] < t <= rc + reach]
+                if hh:
+                    g = min(hh) - rc
+                    if best[m][i] is None or g < best[m][i]:
+                        best[m][i] = g
+    return best
+
+
+_DENSE_CACHE = {}
+_ZONE_INDEX = {}
+_TZ_SEED_MESH = {}
+_ZONE_CELL = 10.0
+
+
+def _in_zones(p, zones):
+    """Whether p lies in any box of zones, through a grid of the boxes
+    (built once per zones list; a grade asks this a few hundred thousand
+    times)."""
+    hit = _ZONE_INDEX.get(id(zones))
+    if hit is None or hit[0] is not zones:
+        grid = {}
+        f = math.floor
+        for z in zones:
+            lo = [int(f(z[i] / _ZONE_CELL)) for i in range(3)]
+            hi = [int(f(z[i + 3] / _ZONE_CELL)) for i in range(3)]
+            for a in range(lo[0], hi[0] + 1):
+                for b in range(lo[1], hi[1] + 1):
+                    for c in range(lo[2], hi[2] + 1):
+                        grid.setdefault((a, b, c), []).append(z)
+        if len(_ZONE_INDEX) > 16:
+            _ZONE_INDEX.clear()
+        hit = _ZONE_INDEX[id(zones)] = (zones, grid)
+    k = (int(math.floor(p[0] / _ZONE_CELL)), int(math.floor(p[1] / _ZONE_CELL)),
+         int(math.floor(p[2] / _ZONE_CELL)))
+    for z in hit[1].get(k, ()):
+        if z[0] <= p[0] <= z[3] and z[1] <= p[1] <= z[4] \
+                and z[2] <= p[2] <= z[5]:
+            return True
+    return False
+_GAP_CACHE = {}
+
+
+def _dense_samples(faces):
+    """Every face of a schema /7 housing_faces list resampled from its mesh
+    at SKIN_CELL_MM (mm, facet normals), cached per list: the baseline is
+    shared by every candidate in a batch."""
+    key = id(faces)
+    hit = _DENSE_CACHE.get(key)
+    if hit is not None and hit[0] is faces:
+        _DENSE_CACHE[key] = _DENSE_CACHE.pop(key)   # most recently used
+        return hit[1]
+    out = [bin_triangles(mesh_triangles_mm(f), SKIN_CELL_MM, split=True)[2]
+           for f in faces]
+    # least recently used goes past three lists: the baseline is used by
+    # every grade and stays, while a cache keyed per candidate would grow
+    # with every part graded
+    while len(_DENSE_CACHE) >= 3:
+        _DENSE_CACHE.pop(next(iter(_DENSE_CACHE)))
+    _DENSE_CACHE[key] = (faces, out)
+    return out
+
+
+
+
+class Grader:
+    def __init__(self, baseline, measured):
+        self.bl = baseline
+        # A bodily translation along X is normalised away before anything is
+        # compared, so a part with a reset origin is judged on its geometry.
+        measured, self.plane_shift_m = normalise_plane_offset(baseline,
+                                                              measured)
+        self.ms = measured
+        self.P = baseline["plane_x_m"]
+        self.B = {b["id"]: b for b in baseline["bodies"]}
+        self.C = {c["id"]: c for c in measured["bodies"]}
+        self.Broles = baseline["roles"]
+        self.Croles = dict(measured["roles"])
+        self.cluster_identity = self._resolve_button_clusters()
+        self.match_diag = {}
+        self.match = self._match()
+        self._pair_rows_cache = None
+        # Roles present in the baseline that the candidate cannot supply a
+        # full set of bodies for -- deleted, or remodelled past recognition.
+        # Either way the requested edit is not demonstrated, so these score
+        # zero.  Skipping them instead would let a candidate delete a whole
+        # cluster and be graded as having nothing to check.
+        self.unmatched_roles = {}
+        for role, bids in self.Broles.items():
+            if not bids:
+                continue
+            missing = [b for b in bids if not self.match[b].get("cand")]
+            if missing:
+                self.unmatched_roles[role] = {
+                    "baseline_bodies": len(bids),
+                    "candidate_bodies": len(self.Croles.get(role, [])),
+                    "unmatched": len(missing),
+                }
+
+    def _role_unmatched(self, role):
+        return role in self.unmatched_roles
+
+    # -- button-cluster identity -----------------------------------------
+    def _cluster_signature(self, capture, roles, role):
+        """Mean small engraved faces per body of a button diamond.
+
+        NO LONGER USED FOR IDENTITY -- see _cluster_shape(). It used to be,
+        on the reasoning that the arrows cut into the d-pad add small faces
+        the round buttons do not have; that is true of the seed and false of
+        the reference, which engraves the four glyphs on the buttons and
+        simplifies the arrows, inverting the key. It is reported beside the
+        shape because it remains the witness that separates `missing_glyphs`
+        from a model that kept its glyphs.
+        """
+        ids = roles.get(role) or []
+        if not ids:
+            return None
+        smf = capture.get("small_face_counts") or {}
+        # _small_face_counts() emits a key for EVERY body, so a missing key
+        # means the census was not taken, not that the body has no small
+        # faces. Reading the gap as a measured zero would let two clusters
+        # look identical whenever the data is simply absent -- and that is
+        # exactly the condition this class treats as a destroyed d-pad.
+        if any(i not in smf for i in ids):
+            return None
+        return sum(smf[i] for i in ids) / len(ids)
+
+    def _cluster_shape(self, bodies, roles, role):
+        """(plan aspect, plan footprint mm2, diamond radius mm), or None.
+
+        WHAT THE ENGRAVING COUNT WAS STANDING IN FOR. `_cluster_signature`
+        identified the d-pad as the diamond with more small engraved faces.
+        That held for the seed, where the arrows are cut into the d-pad and
+        the round buttons are bare -- and it inverted the moment a candidate
+        engraved the four glyphs on the buttons, which is what the reference
+        does.  The reference's buttons read 15/11/0/24 small faces against
+        its d-pad's 5/5/5/5, so the d-pad was labelled `face_buttons`, the
+        clusters looked unmoved, and a model that performed the swap scored
+        4.300 of 7.0 for it.
+
+        Shape does not invert.  A d-pad arm is a rectangle in plan, 13.8 by
+        17.0 mm, aspect 1.23; a round button's bounding box is square by
+        construction, 18.8 by 18.8, aspect 1.00 and half again the
+        footprint.  Nothing engraved on a face changes either, and nothing
+        this task asks for does: widening moves the clusters apart, it does
+        not reshape a button.
+
+        Returned as a vector rather than a scalar so the caller can MATCH
+        against the seed instead of thresholding.  A candidate that rebuilds
+        both clusters at a different size still matches the seed's pairing
+        correctly; an absolute cut-off would not survive that.
+        """
+        ids = roles.get(role) or []
+        if len(ids) < 2:
+            return None
+        bs = [bodies.get(i) for i in ids]
+        if any(b is None or not b.get("bbox_m") for b in bs):
+            return None
+        cx = sum(b["centroid_m"][0] for b in bs) / len(bs)
+        cz = sum(b["centroid_m"][2] for b in bs) / len(bs)
+        rad = sum(math.hypot(b["centroid_m"][0] - cx,
+                             b["centroid_m"][2] - cz) for b in bs) / len(bs)
+        asp, foot = [], []
+        for b in bs:
+            bb = b["bbox_m"]
+            dx, dz = (bb[3] - bb[0]) * MM, (bb[5] - bb[2]) * MM
+            lo, hi = sorted((abs(dx), abs(dz)))
+            if lo <= 0:
+                return None
+            asp.append(hi / lo)
+            foot.append(abs(dx * dz))
+        return (sum(asp) / len(asp), sum(foot) / len(foot), rad * MM)
+
+    @staticmethod
+    def _shape_dist(a, b):
+        """Largest relative difference between two cluster shapes."""
+        if a is None or b is None:
+            return None
+        return max(abs(x - y) / max(abs(x), abs(y), 1e-9)
+                   for x, y in zip(a, b))
+
+    def _cluster_centre_x(self, ids):
+        return sum(self.C[i]["centroid_m"][0] for i in ids) / len(ids)
+
+    def _expected_cluster_x(self, role):
+        """Where the mirror alone would put this cluster's centre.
+
+        Widening is deliberately left out, the same way _perm_cost() leaves it
+        out: this is a tie-break between two diamonds ~176 mm apart, and
+        folding in the candidate's widening would make c2's own answer depend
+        on c1's.
+        """
+        bids = self.Broles.get(role) or []
+        if not bids:
+            return None
+        return sum(mirror_x(self.B[i]["centroid_m"][0], self.P)
+                   for i in bids) / len(bids)
+
+    def _resolve_button_clusters(self):
+        """Decide which candidate diamond is the d-pad, or refuse to.
+
+        assign_roles() labels the two diamonds by their engraving signature
+        and falls back to position when that ties. A tie is not a detail: it
+        means the candidate no longer has two distinguishable button
+        clusters. Accepting the fallback label would make the score depend on
+        which way the tie fell -- on this corpus that moves c2 between 0.0 and
+        1.0 for the same part -- and would report a confident reason for it.
+
+        Three outcomes:
+
+        * candidate separates the clusters -> trust the signature, and force
+          the labels to follow it even if assign_roles() ordered them the
+          other way round;
+        * seed cannot separate them either -> nothing to measure, leave the
+          labels alone and say so;
+        * seed separates them and the candidate does not -> the role whose
+          signature has no counterpart is GONE. It is emptied so the existing
+          unmatched-role machinery scores it zero, and the surviving role
+          keeps whichever diamond fits its expected position best, so the
+          coin toss cannot also cost the candidate the cluster it did place
+          correctly.
+        """
+        roles = ("dpad", "face_buttons")
+        if not all(self.Croles.get(r) for r in roles):
+            return None
+        if not all(self.Broles.get(r) for r in roles):
+            return None
+
+        bsh = {r: self._cluster_shape(self.B, self.Broles, r)
+               for r in roles}
+        csh = {r: self._cluster_shape(self.C, self.Croles, r)
+               for r in roles}
+        if any(v is None for v in list(bsh.values()) + list(csh.values())):
+            return None
+
+        seed_sep = self._shape_dist(bsh["dpad"], bsh["face_buttons"])
+        cand_sep = self._shape_dist(csh["dpad"], csh["face_buttons"])
+
+        # Kept as evidence, no longer as identity.  It is still what tells
+        # `missing_glyphs` from the reference; it is simply not what tells a
+        # d-pad from a button, because a candidate is free to engrave the
+        # buttons and the reference does.
+        bsig = {r: self._cluster_signature(self.bl, self.Broles, r)
+                for r in roles}
+        csig = {r: self._cluster_signature(self.ms, self.Croles, r)
+                for r in roles}
+
+        def _sh(v):
+            return {"plan_aspect": round(v[0], 3),
+                    "plan_footprint_mm2": round(v[1], 1),
+                    "diamond_radius_mm": round(v[2], 2)}
+
+        out = {"seed_shape": {r: _sh(bsh[r]) for r in roles},
+               "candidate_shape": {r: _sh(csh[r]) for r in roles},
+               "seed_separation": round(seed_sep, 3),
+               "candidate_separation": round(cand_sep, 3),
+               "min_separation": CLUSTER_SHAPE_MIN_SEP,
+               "engraved_faces_per_body": {
+                   "seed": {r: (None if bsig[r] is None else round(bsig[r], 2))
+                            for r in roles},
+                   "candidate": {r: (None if csig[r] is None
+                                     else round(csig[r], 2)) for r in roles},
+                   "note": "reported, not used for identity: a candidate may "
+                           "engrave the face buttons, and the reference "
+                           "does, which inverts this key"}}
+
+        if seed_sep < CLUSTER_SHAPE_MIN_SEP:
+            out["verdict"] = "seed_indistinct"
+            out["note"] = ("the seed's own button clusters have the same "
+                           "plan shape, so identity cannot be measured for "
+                           "either part; labels left as found")
+            return out
+
+        if cand_sep >= CLUSTER_SHAPE_MIN_SEP:
+            # Both assignments are priced against the seed and the cheaper
+            # one wins.  No absolute cut-off: a candidate that rebuilds both
+            # clusters at a different size still pairs up correctly.
+            keep = (self._shape_dist(csh["dpad"], bsh["dpad"])
+                    + self._shape_dist(csh["face_buttons"],
+                                       bsh["face_buttons"]))
+            swap = (self._shape_dist(csh["dpad"], bsh["face_buttons"])
+                    + self._shape_dist(csh["face_buttons"], bsh["dpad"]))
+            out["match_cost"] = {"as_labelled": round(keep, 3),
+                                 "swapped": round(swap, 3)}
+            if swap < keep:
+                self.Croles["dpad"], self.Croles["face_buttons"] = (
+                    self.Croles["face_buttons"], self.Croles["dpad"])
+                out["relabelled"] = True
+            out["verdict"] = "measured"
+            return out
+
+        # Dead heat on the candidate. Which seed role do both diamonds look
+        # like? The other one is the one that is missing.
+        common = tuple((csh["dpad"][i] + csh["face_buttons"][i]) / 2.0
+                       for i in range(3))
+        survivor = min(roles, key=lambda r: self._shape_dist(bsh[r], common))
+        missing = [r for r in roles if r != survivor][0]
+
+        exp = self._expected_cluster_x(survivor)
+        cands = [self.Croles[r] for r in roles]
+        if exp is not None:
+            cands.sort(key=lambda ids: abs(self._cluster_centre_x(ids) - exp))
+        self.Croles[survivor] = cands[0]
+        self.Croles[missing] = []
+
+        out["verdict"] = "indistinguishable"
+        out["survivor"] = survivor
+        out["missing"] = missing
+        out["note"] = (
+            f"the candidate's two button diamonds have the same plan shape "
+            f"(aspect {round(common[0], 3)}, footprint "
+            f"{round(common[1], 1)} mm2), which matches the seed's "
+            f"{survivor}; the seed separates its clusters by "
+            f"{round(seed_sep, 3)}. The {missing} is therefore absent as a "
+            f"distinct cluster and is scored as an unmatched role. The "
+            f"{survivor} keeps the diamond nearer its expected position, so "
+            f"an unmeasurable label cannot also sink a cluster the candidate "
+            f"did place correctly.")
+        return out
+
+    # -- matching ---------------------------------------------------------
+    def _perm_cost(self, bids, perm, expected):
+        """Shape-first cost of one baseline->candidate assignment.
+
+        Fingerprints are invariant under both translation and mirroring, so
+        they identify WHICH button is which (cross vs circle vs triangle)
+        without assuming anything about where it was supposed to move.
+        Position only breaks ties between genuinely identical bodies, and it
+        is measured against the MIRROR hypothesis alone -- never against the
+        widening hypothesis, which is what c1 is supposed to be testing.
+        """
+        cost = 0.0
+        for b, c in zip(bids, perm):
+            cost += TOL["match_fp_weight"] * fp_distance(self.B[b], self.C[c])
+            resid_mm = d3(expected[b], self.C[c]["centroid_m"]) * MM
+            cost += TOL["match_pos_weight_per_mm"] * resid_mm
+        return cost
+
+    def _best_assignment(self, bids, cids, expected):
+        best, best_cost, second = None, float("inf"), float("inf")
+        for perm in permutations(cids):
+            cost = self._perm_cost(bids, perm, expected)
+            if cost < best_cost:
+                second, best_cost, best = best_cost, cost, perm
+            elif cost < second:
+                second = cost
+        margin = (second - best_cost) if second < float("inf") else None
+        return best, best_cost, margin
+
+    def _match(self):
+        """Per-role matching, baseline -> candidate.
+
+        Two hypotheses are costed for every role -- "the candidate mirrored
+        this role" and "the candidate left it where it was" -- and the
+        cheaper assignment wins.  Costing only the mirrored hypothesis would
+        assume the answer to the questions c1/c2/c4 go on to ask.
+        """
+        m = {}
+        for role, bids in self.Broles.items():
+            cids = self.Croles.get(role, [])
+            if not cids:
+                for bid in bids:
+                    m[bid] = {"cand": None, "role": role}
+                self.match_diag[role] = {"hypothesis": None,
+                                         "note": "role absent on candidate"}
+                continue
+
+            if len(bids) == len(cids) and len(bids) <= 6:
+                exp_mirror = {bid: [mirror_x(self.B[bid]["centroid_m"][0],
+                                             self.P)]
+                              + self.B[bid]["centroid_m"][1:]
+                              for bid in bids}
+                exp_ident = {bid: list(self.B[bid]["centroid_m"])
+                             for bid in bids}
+                mp, mc, mm_ = self._best_assignment(bids, cids, exp_mirror)
+                ip, ic, im = self._best_assignment(bids, cids, exp_ident)
+                if mc <= ic:
+                    perm, hyp, margin, other = mp, "mirrored", mm_, ic
+                else:
+                    perm, hyp, margin, other = ip, "identity", im, mc
+                self.match_diag[role] = {
+                    "hypothesis": hyp,
+                    "cost_mirrored": round(mc, 5),
+                    "cost_identity": round(ic, 5),
+                    "runner_up_margin": (round(margin, 5)
+                                         if margin is not None else None),
+                }
+                for b, c in zip(bids, perm):
+                    m[b] = {"cand": c, "role": role, "hypothesis": hyp,
+                            "residual_m": d3(self.B[b]["centroid_m"],
+                                             self.C[c]["centroid_m"])}
+            else:
+                bs = sorted(bids, key=lambda i: -self.B[i]["volume_m3"])
+                cs = sorted(cids, key=lambda i: -self.C[i]["volume_m3"])
+                self.match_diag[role] = {
+                    "hypothesis": "volume_rank",
+                    "note": f"body count changed {len(bids)} -> {len(cids)}",
+                }
+                for i, b in enumerate(bs):
+                    m[b] = {"cand": cs[i] if i < len(cs) else None,
+                            "role": role, "via": "volume_rank"}
+        return m
+
+    # -- shared measurement ----------------------------------------------
+    def _pair_rows(self):
+        """Mirror-pair separation growth, in millimetres, per role."""
+        if self._pair_rows_cache is not None:
+            return self._pair_rows_cache
+        rows = []
+        for role in WIDTH_PAIR_ROLES:
+            bids = self.Broles.get(role, [])
+            if len(bids) != 2:
+                continue
+            cs = [self.match[b]["cand"] for b in bids]
+            if None in cs:
+                continue
+            seed = abs(self.B[bids[0]]["centroid_m"][0]
+                       - self.B[bids[1]]["centroid_m"][0]) * MM
+            got = abs(self.C[cs[0]]["centroid_m"][0]
+                      - self.C[cs[1]]["centroid_m"][0]) * MM
+            rows.append({"role": role, "seed_mm": round(seed, 3),
+                         "got_mm": round(got, 3),
+                         "delta_mm": round(got - seed, 3)})
+        self._pair_rows_cache = rows
+        return rows
+
+    def _actual_half_m(self):
+        """Half of the widening the candidate ACTUALLY applied, in metres.
+
+        c2 uses this instead of the nominal 7.5 mm so that "is the widening
+        the right size?" (c1) and "are the clusters consistent with the
+        shell the candidate built?" (c2) stay independent questions.  An
+        unwidened shell with correctly swapped clusters then loses c1 only,
+        instead of being charged twice for a single mistake.
+        """
+        # The mirror pairs, not the shell: on the shipped reference the
+        # housing halves grow +20.6 mm while the controls move +15.0, so
+        # the shell is not a ruler for where the controls belong.
+        mean_delta_mm = self._pair_mean_delta_mm()
+        if mean_delta_mm is None:
+            return POLICY["half_mm"] / MM
+        return (mean_delta_mm / 2.0) / MM
+
+    def _pair_mean_delta_mm(self):
+        rows = self._pair_rows()
+        if not rows:
+            return None
+        return sum(r["delta_mm"] for r in rows) / len(rows)
+
+    def _shell_delta_mm(self):
+        """Growth of the housing-half separation, in mm, or None when either
+        capture predates the measurement (schema < /5)."""
+        b = self.bl.get("housing_halves")
+        c = self.ms.get("housing_halves")
+        if not b or not c:
+            return None
+        return (c["separation_m"] - b["separation_m"]) * MM
+
+    # -- c0: rebuild health ---------------------------------------------
+    def c0_health(self):
+        """How badly the feature tree is broken, relative to the seed.
+
+        Graded on the FRACTION of features newly broken rather than the raw
+        count, so the criterion transfers to tasks whose trees are a
+        different size.
+        """
+        rb = self.ms.get("rebuild", {})
+        n_feat = rb.get("features") or 0
+        broken = rb.get("errors")
+        if broken is None:
+            return {"score": 1.0, "status": UNVERIFIABLE,
+                    "evidence": "no rebuild census available"}
+        frac = (broken / n_feat) if n_feat else (1.0 if broken else 0.0)
+        score = score_error(frac, TOL["health_perfect_frac"],
+                            TOL["health_zero_frac"])
+        return {"score": round(score, 4), "status": status_of(score),
+                "newly_broken": broken,
+                "features": n_feat,
+                "broken_fraction": round(frac, 5),
+                "broken_features": rb.get("broken_features", [])[:10],
+                "evidence": "fraction of features newly broken versus the "
+                            "seed census. Pre-existing seed errors are not "
+                            "charged to the candidate."}
+
+    # -- c0: modelling hygiene -------------------------------------------
+    def c0_hygiene(self):
+        """Model quality that geometry does not expose.
+
+        New rebuild warnings, sketches falling out of their seed constraint
+        state, features suppressed rather than removed, and new external
+        references. Everything is a DELTA against the seed: the seed may
+        itself contain under-defined sketches and the candidate must not be
+        charged for them.
+        """
+        bm = self.bl.get("modelling")
+        cm = self.ms.get("modelling")
+        parts, detail = {}, {}
+
+        # New rebuild warnings are available even without a modelling census.
+        rb = self.ms.get("rebuild", {})
+        new_warn = len(rb.get("new_warnings", []) or [])
+        parts["new_warnings"] = score_error(
+            new_warn, TOL["warn_perfect"], TOL["warn_zero"])
+        detail["new_warnings"] = {"count": new_warn,
+                                  "score": round(parts["new_warnings"], 4)}
+
+        if not bm or not cm:
+            # No seed census to compare against: this is a gap in the
+            # baseline, not a fault of the candidate, so it must not cost
+            # marks. It is reported loudly instead.
+            score = parts["new_warnings"]
+            return {"score": round(score, 4), "status": status_of(score),
+                    "components": {k: round(v, 4) for k, v in parts.items()},
+                    "detail": detail,
+                    "evidence": "only rebuild warnings could be graded -- the "
+                                "baseline carries no modelling census. "
+                                "Re-freeze it with --capture-baseline to "
+                                "enable sketch, suppression and external "
+                                "reference checks."}
+
+        # -- sketches: statuses the seed never had -------------------------
+        # Counting sketches outside the seed's *dominant* status looks
+        # reasonable and is not: the seed legitimately mixes statuses, and any
+        # real edit adds sketches across the same mix. Measured on the corpus,
+        # that metric moved identically for the reference and for almost every
+        # adversarial -- no signal, and it docked the reference.
+        #
+        # What does carry signal is a status the seed never exhibited at all.
+        # The seed defines which states are normal FOR THIS MODEL; a new one
+        # appearing means a sketch entered a state the author never had, which
+        # is degradation regardless of what the numeric code means.
+        bsk = (bm.get("sketches") or {}).get("status_counts") or {}
+        csk = (cm.get("sketches") or {}).get("status_counts") or {}
+        if bsk and csk:
+            known = set(bsk)
+            novel = {k: v for k, v in csk.items()
+                     if k not in known and k != "unreadable"}
+            n_novel = sum(novel.values())
+            parts["sketch_definition"] = score_error(
+                n_novel, TOL["sketch_perfect"], TOL["sketch_zero"])
+            detail["sketch_definition"] = {
+                "seed_statuses": sorted(known),
+                "candidate_statuses": sorted(csk),
+                "novel_statuses": novel,
+                "sketches_in_novel_statuses": n_novel,
+                "score": round(parts["sketch_definition"], 4),
+                "note": "sketches in a constraint status the seed never had"}
+
+        # -- suppressed features ------------------------------------------
+        b_sup = (bm.get("suppressed") or {}).get("count")
+        c_sup = (cm.get("suppressed") or {}).get("count")
+        if b_sup is not None and c_sup is not None:
+            growth = max(0, c_sup - b_sup)
+            parts["suppressed_features"] = score_error(
+                growth, TOL["suppressed_perfect"], TOL["suppressed_zero"])
+            detail["suppressed_features"] = {
+                "seed": b_sup, "candidate": c_sup, "growth": growth,
+                "names": (cm.get("suppressed") or {}).get("names", [])[:10],
+                "score": round(parts["suppressed_features"], 4)}
+
+        # -- external references ------------------------------------------
+        b_ref = (bm.get("external_refs") or {}).get("count")
+        c_ref = (cm.get("external_refs") or {}).get("count")
+        if b_ref is not None and c_ref is not None:
+            growth = max(0, c_ref - b_ref)
+            parts["external_refs"] = score_error(
+                growth, TOL["extref_perfect"], TOL["extref_zero"])
+            detail["external_refs"] = {
+                "seed": b_ref, "candidate": c_ref, "growth": growth,
+                "names": (cm.get("external_refs") or {}).get("names", [])[:10],
+                "score": round(parts["external_refs"], 4)}
+
+        unavailable = [k for k, v in (cm.get("available") or {}).items()
+                       if not v]
+        score = mean_scores(list(parts.values()))
+        out = {"score": round(score, 4), "status": status_of(score),
+               "components": {k: round(v, 4) for k, v in parts.items()},
+               "detail": detail,
+               "evidence": "model quality as a delta against the seed: new "
+                           "rebuild warnings, sketches leaving their seed "
+                           "constraint state, features suppressed rather "
+                           "than removed, new external references."}
+        if unavailable:
+            out["unavailable_probes"] = unavailable
+            out["notes"] = (cm.get("notes") or [])[:5]
+        return out
+
+    # -- c1 ------------------------------------------------------------
+    def _width_score(self, delta_mm):
+        return asymmetric_target_score(
+            delta_mm, POLICY["width_delta_mm"], TOL["width_perfect_mm"],
+            TOL["width_zero_under_mm"], TOL["width_zero_over_mm"])
+
+    def _shell_score(self, shell_mm):
+        target = POLICY["width_delta_mm"]
+        if shell_mm <= target:
+            return clamp01(shell_mm / target)
+        return score_error(shell_mm - target,
+                           TOL["shell_full_to_mm"] - target,
+                           TOL["shell_zero_at_mm"] - target)
+
+    def c1_width(self):
+        """Was the BODY widened by 15 mm?
+
+        Half the score is the mirror-pair growth against +15 mm, half is
+        whether the shell's own halves (housing_halves) grew: full credit
+        from +15 mm to twice that, nothing at three times it. A shell widened
+        with its controls left behind used to score 0 here; it now keeps the
+        half it earned. Captures older than /5 fall back to the pairs.
+        """
+        target = POLICY["width_delta_mm"]
+        rows = self._pair_rows()
+        for r in rows:
+            r["score"] = round(self._width_score(r["delta_mm"]), 4)
+        # Mean of per-pair SCORES, not a score of the mean delta: averaging
+        # deltas would let +30 mm on one pair cancel 0 mm on another and
+        # hand full marks to a visibly deformed part.
+        pair_score = mean_scores([r["score"] for r in rows], default=0.0)
+        shell = self._shell_delta_mm()
+        if shell is None:
+            return {"score": round(pair_score, 4),
+                    "status": status_of(pair_score),
+                    "target_delta_mm": target, "witness": "mirror pairs",
+                    "pairs": rows,
+                    "note": "capture predates housing_halves (schema /5): "
+                            "graded on the mirror pairs as in 2.3.x",
+                    "evidence": "growth of mirror-pair separation "
+                                "(sticks/triggers/bumpers)."}
+        shell_score = self._shell_score(shell)
+        score = 0.5 * pair_score + 0.5 * shell_score
+        return {"score": round(score, 4), "status": status_of(score),
+                "target_delta_mm": target, "witness": "pairs + shell",
+                "pair_score": round(pair_score, 4),
+                "shell_delta_mm": round(shell, 3),
+                "shell_score": round(shell_score, 4),
+                "pairs": rows,
+                "evidence": "half: mirror-pair separation growth against "
+                            "+15 mm (asymmetric: undershoot reaches 0 at "
+                            "delta=0, overshoot decays more slowly); half: "
+                            "growth of the housing halves' separation "
+                            "(area-weighted face X either side of the "
+                            "plane): full credit from +15 mm to +30 mm, "
+                            "rising from 0 below, falling to 0 at +45 mm."}
+
+    # -- c2 ------------------------------------------------------------
+    def c2_spacing(self):
+        half = self._actual_half_m()
+        det = {"half_applied_mm": round(half * MM, 3)}
+
+        # 2.1 -- diamonds must translate as rigid units
+        intra_by_role, intra_det = {}, {}
+        for role in RIGID_ROLES:
+            bids = self.Broles.get(role, [])
+            if not bids:
+                continue
+            if self._role_unmatched(role):
+                intra_by_role[role] = 0.0
+                intra_det[role] = {"score": 0.0, "status": FAIL,
+                                   "note": "cluster missing or unrecognisable "
+                                           "on the candidate",
+                                   **self.unmatched_roles[role]}
+                continue
+            worst = 0.0
+            seen = False
+            for i in range(len(bids)):
+                for j in range(i + 1, len(bids)):
+                    a, b = bids[i], bids[j]
+                    ca, cb = self.match[a]["cand"], self.match[b]["cand"]
+                    if not ca or not cb:
+                        continue
+                    seen = True
+                    seed = d3(self.B[a]["centroid_m"],
+                              self.B[b]["centroid_m"]) * MM
+                    got = d3(self.C[ca]["centroid_m"],
+                             self.C[cb]["centroid_m"]) * MM
+                    worst = max(worst, abs(got - seed))
+            if not seen:
+                continue
+            s = score_error(worst, TOL["intra_perfect_mm"],
+                            TOL["intra_zero_mm"])
+            intra_by_role[role] = s
+            intra_det[role] = {"max_spacing_drift_mm": round(worst, 3),
+                               "score": round(s, 4)}
+        intra = weighted_role_mean(intra_by_role)
+        det["intra_cluster"] = intra_det
+
+        # 2.2 -- cluster centres, against the candidate's OWN widening
+        pos_by_role, pos_det = {}, {}
+        for role in POSITION_ROLES:
+            bids = self.Broles.get(role, [])
+            if not bids:
+                continue
+            if self._role_unmatched(role):
+                pos_by_role[role] = 0.0
+                pos_det[role] = {"score": 0.0, "status": FAIL,
+                                 "note": "cluster missing or unrecognisable "
+                                         "on the candidate -- the requested "
+                                         "move is not demonstrated",
+                                 **self.unmatched_roles[role]}
+                continue
+            cs = [self.match[i]["cand"] for i in bids]
+            exp = [
+                sum(mirror_widen_x(self.B[i]["centroid_m"][0], self.P, half)
+                    for i in bids) / len(bids),
+                sum(self.B[i]["centroid_m"][1] for i in bids) / len(bids),
+                sum(self.B[i]["centroid_m"][2] for i in bids) / len(bids),
+            ]
+            got = [sum(self.C[c]["centroid_m"][k] for c in cs) / len(cs)
+                   for k in range(3)]
+            resid = d3(exp, got) * MM
+            s = score_error(resid, TOL["cluster_perfect_mm"],
+                            TOL["cluster_zero_mm"])
+            pos_by_role[role] = s
+            pos_det[role] = {"expected_x_mm": round(exp[0] * MM, 2),
+                             "got_x_mm": round(got[0] * MM, 2),
+                             "residual_mm": round(resid, 2),
+                             "score": round(s, 4)}
+        # Weighted by ROLE_WEIGHT: skipping a whole button cluster must cost
+        # more than nudging a bumper, and the stick/trigger/bumper pairs are
+        # already what c1 grades.
+        position = weighted_role_mean(pos_by_role)
+        det["cluster_position"] = pos_det
+        det["role_weights"] = ROLE_WEIGHT
+
+        rigid_mult = RIGID_FLOOR + (1.0 - RIGID_FLOOR) * clamp01(intra)
+
+        # 2.3 -- controls vs grips: REPORTED, not scored. The shipped
+        # reference grows its housing halves +20.6 mm while its controls
+        # move +15.0, so "pairs == shell" would fail the reference itself.
+        shell = self._shell_delta_mm()
+        pairs = self._pair_mean_delta_mm()
+        if shell is not None and pairs is not None:
+            det["controls_follow_grips"] = {
+                "shell_delta_mm": round(shell, 3),
+                "pairs_delta_mm": round(pairs, 3),
+                "note": "reported only; not part of the score"}
+
+        score = clamp01(position) * rigid_mult
+        return {"score": round(score, 4), "status": status_of(score),
+                "model": "cluster_placement x rigidity",
+                "components": {"cluster_position": round(position, 4),
+                               "intra_cluster_rigidity": round(intra, 4),
+                               "rigidity_multiplier": round(rigid_mult, 4)},
+                "detail": det,
+                "evidence": "button diamonds must land where the mirror "
+                            "plus the candidate's own widening puts them, "
+                            "and travel as rigid units. Graded against the "
+                            "applied widening rather than the nominal "
+                            "7.5 mm, which keeps it independent of c1. "
+                            "Symmetric pairs are excluded: invariant as a "
+                            "set, their mean centre proves nothing."}
+
+    # -- c3 ------------------------------------------------------------
+    @staticmethod
+    def _openings(cap, dx=0.0):
+        """Round openings in a capture's housing a control can sit in: axis
+        within coax_axis_dot of vertical, radius at most coax_open_max_r_mm.
+        Cylinders and (schema /7) cones, so a bore modelled with draft still
+        counts. Each is (axis line [ox, oy, oz, ax, ay, az] in mm, radius
+        or None for a cone). `dx` moves the candidate's housing into the
+        frame its bodies were normalised to (normalise_plane_offset shifts
+        bodies, not housing_faces)."""
+        out = []
+        for f in cap.get("housing_faces") or []:
+            for kind in ("cyl", "cone"):
+                cy = f.get(kind)
+                if not cy or abs(cy[4]) < TOL["coax_axis_dot"] \
+                        or cy[6] > TOL["coax_open_max_r_mm"]:
+                    continue
+                out.append(([cy[0] + dx] + list(cy[1:6]),
+                            cy[6] if kind == "cyl" else None))
+        return out
+
+    @staticmethod
+    def _axis_offset_mm(p, cy):
+        v = [p[i] - cy[i] for i in range(3)]
+        t = sum(v[i] * cy[3 + i] for i in range(3))
+        return math.sqrt(max(0.0, sum(x * x for x in v) - t * t))
+
+    def _seated(self):
+        """Every control whose centre sits on the axis of a round housing
+        opening in the seed (a stick, a face button, the PS button), how
+        far its matched candidate body now sits from the nearest round
+        opening in the candidate, and whether that opening's bore kept the
+        seed's radius (an opening bored out or shrunk around a control is an
+        edit inside the control margin the skin checks leave alone).
+
+        Within one part: the candidate's control against the candidate's own
+        opening, both in the same frame, and the seed only to know which
+        controls were seated and how big their bore was. Not the reference.
+        A seated control with no round opening left anywhere near scores 0:
+        the opening was filled, deleted or reshaped past recognition.
+
+        Returns (rows, note); rows is None when nothing can be checked."""
+        if not self.bl.get("housing_faces") \
+                or not self.ms.get("housing_faces"):
+            return None, "a capture has no housing_faces: not checked"
+        so = self._openings(self.bl)
+        co = self._openings(self.ms, self.plane_shift_m * MM)
+        if not so:
+            return None, "the seed has no round openings: not checked"
+        rows = []
+        for role, bids in self.Broles.items():
+            if role == "housing":
+                continue
+            for bid in bids:
+                b = self.B.get(bid)
+                cid = (self.match.get(bid) or {}).get("cand")
+                if not b or not cid or cid not in self.C:
+                    continue
+                p = [v * MM for v in b["centroid_m"]]
+                # the bore: the smallest cylinder on the control's axis
+                # (rings around it may be restyled -- the reference turns
+                # the stick surround from 23 to 25.5 mm)
+                s_r = [r for ax, r in so if r is not None
+                       and self._axis_offset_mm(p, ax) <= TOL["coax_seed_mm"]]
+                if not s_r:
+                    continue
+                q = [v * MM for v in self.C[cid]["centroid_m"]]
+                row = {"body": bid, "role": role}
+                if not co:
+                    row.update(offset_mm=None, score=0.0,
+                               note="no round opening in the candidate")
+                    rows.append(row)
+                    continue
+                off = min(self._axis_offset_mm(q, ax) for ax, _ in co)
+                near = [r for ax, r in co if self._axis_offset_mm(q, ax)
+                        <= off + TOL["coax_seed_mm"]]
+                sc = score_error(off, TOL["coax_perfect_mm"],
+                                 TOL["coax_zero_mm"])
+                c_r = [r for r in near if r is not None]
+                if c_r and len(c_r) == len(near):
+                    dr = min(c_r) - min(s_r)
+                    sc = min(sc, score_error(dr,
+                                             TOL["coax_radius_perfect_mm"],
+                                             TOL["coax_radius_zero_mm"]))
+                    row["bore_radius_mm"] = {"seed": min(s_r),
+                                             "got": min(c_r)}
+                else:
+                    row["bore_radius_mm"] = {"seed": min(s_r), "got": None,
+                                             "note": "drafted (cone) bore: "
+                                                     "radius not compared"}
+                row.update(offset_mm=round(off, 2), score=round(sc, 4))
+                rows.append(row)
+        if not rows:
+            return None, "no control is seated in a round opening in the seed"
+        return rows, None
+
+    @staticmethod
+    def _housing_tris(cap):
+        out = []
+        for f in cap.get("housing_faces") or []:
+            out.extend(mesh_tris3_mm(f))
+        return out
+
+    def _clearances(self):
+        """Every control keeps the gap to its own opening: the seed's gap,
+        ray by ray around the control (control_gaps), against the matched
+        candidate control's gap to the candidate's own housing. Within each
+        part, so no frame or widening enters; only narrowing is charged
+        (the worst ray), because the reference opens some surrounds up --
+        the stick rings by 1.2 mm, the face-button wells by up to 6 mm --
+        while a control pushed toward a wall, or a wall pushed toward a
+        control, narrows the gap on that side.
+
+        Returns (rows, note); rows is None when nothing can be checked."""
+        sm, cm = self.bl.get("control_meshes"), self.ms.get("control_meshes")
+        if not sm or not cm:
+            return None, ("a capture has no control_meshes (schema /7): "
+                          "not checked")
+        # a face SolidWorks could not tessellate has an empty mesh and just
+        # contributes no triangles; a capture without meshes is schema /6
+        if not all("mt" in f for f in self.bl.get("housing_faces") or [{}]) \
+                or not all("mt" in f
+                           for f in self.ms.get("housing_faces") or [{}]):
+            return None, "a capture has no housing mesh (schema /7): " \
+                         "not checked"
+        key = id(self.bl)
+        hit = _GAP_CACHE.get(key)
+        if hit is None or hit[0] is not self.bl:
+            ht = self._housing_tris(self.bl)
+            hit = (self.bl, {bid: (control_gaps(mesh_tris3_mm(rec), ht)
+                                   or [None])[0]
+                             for bid, rec in sm.items()})
+            _GAP_CACHE.clear()
+            _GAP_CACHE[key] = hit
+        seed = hit[1]
+        ht = self._housing_tris(self.ms)
+        rows = []
+        for role, bids in self.Broles.items():
+            if role == "housing":
+                continue
+            for bid in bids:
+                sg = seed.get(bid)
+                cid = (self.match.get(bid) or {}).get("cand")
+                if not sg or not any(g is not None for g in sg) or not cid:
+                    continue
+                if not (cm.get(cid) or {}).get("mt"):
+                    rows.append({"body": bid, "role": role, "score": None,
+                                 "note": "the candidate control has no mesh "
+                                         "(tessellation failed): not checked"})
+                    continue
+                # Compared with the closest seed pattern of the same kind
+                # (any body of the role, either handedness): a matcher that
+                # paired two look-alike buttons the other way round must
+                # not read as a moved button, while a pushed control
+                # narrows a gap no seed control has.
+                ctr = mesh_tris3_mm(cm[cid])
+                cgs = control_gaps(ctr, ht, (False, True)) or []
+                worst, n = None, 0
+                for ob in bids:
+                    og = seed.get(ob)
+                    if not og or not any(g is not None for g in og):
+                        continue
+                    need = max(1, (sum(g is not None for g in og) + 1) // 2)
+                    for cg in cgs:
+                        nr = [a - b for a, b in zip(og, cg or [])
+                              if a is not None and b is not None]
+                        if len(nr) < need:
+                            continue
+                        w = max(nr + [0.0])
+                        if worst is None or w < worst:
+                            worst, n = w, len(nr)
+                if worst is None:
+                    worst = TOL["gap_zero_mm"]  # its opening is gone
+                rows.append({"body": bid, "role": role,
+                             "rays_compared": n,
+                             "seed_min_gap_mm": round(min(
+                                 g for g in sg if g is not None), 3),
+                             "worst_narrowing_mm": round(worst, 3),
+                             "score": round(score_error(
+                                 worst, TOL["gap_perfect_mm"],
+                                 TOL["gap_zero_mm"]), 4)})
+        rows_scored = [r for r in rows if r["score"] is not None]
+        if not rows_scored:
+            return None, "no control has housing within reach in the seed"
+        return rows, None
+
+    def c3_interference(self):
+        seed_v = self.bl["interference"]["total_volume_m3"]
+        got_v = self.ms["interference"]["total_volume_m3"]
+        growth = max(0.0, got_v - seed_v)
+        intf = score_error(growth, TOL["intf_perfect_m3"],
+                           TOL["intf_zero_m3"])
+        # A control can clear its housing (no interference) and still sit
+        # beside the hole it belongs in. Mean over the seated controls, so
+        # one stray button costs its share.
+        seated, why = self._seated()
+        seat = 1.0 if seated is None else \
+            sum(r["score"] for r in seated) / len(seated)
+        # Every control, round or not, keeps the gap to its own opening.
+        gaps, gwhy = self._clearances()
+        scored = [r["score"] for r in gaps or [] if r["score"] is not None]
+        gap = sum(scored) / len(scored) if scored else 1.0
+        score = min(intf, seat, gap)
+        return {"score": round(score, 4), "status": status_of(score),
+                "components": {"interference": round(intf, 4),
+                               "seated_in_openings": round(seat, 4),
+                               "clearances": round(gap, 4)},
+                "seated": seated if seated is not None else why,
+                "clearances": gaps if gaps is not None else gwhy,
+                "seed_total_m3": seed_v, "measured_total_m3": got_v,
+                "growth_m3": growth, "growth_mm3": round(growth * 1e9, 4),
+                "free_growth_mm3": TOL["intf_perfect_m3"] * 1e9,
+                "zero_at_mm3": TOL["intf_zero_m3"] * 1e9,
+                "measured_pairs": len(self.ms["interference"]["pairs"]),
+                "boolean_failures":
+                    self.ms["interference"].get("boolean_failures"),
+                "evidence": "boolean-intersect volume among control bodies "
+                            "and control-vs-housing; every control that "
+                            "sits on the axis of a round housing opening in "
+                            "the seed must still sit on one; and no "
+                            "control's gap to its own opening may narrow.  Hardware the "
+                            "candidate adds (screws in bosses) is out of "
+                            "scope -- the reference seats screws by design"}
+
+    # -- c4 ------------------------------------------------------------
+    def c4_handedness(self):
+        checks = {}
+
+        # -- witness 1: cluster sides (a weighted FRACTION, not one bit) ---
+        sides, side_by_role = {}, {}
+        for role in MIRROR_ROLES:
+            bids = self.Broles.get(role, [])
+            if not bids:
+                continue
+            if self._role_unmatched(role):
+                sides[role] = {"status": FAIL,
+                               "note": "cluster missing or unrecognisable on "
+                                       "the candidate",
+                               **self.unmatched_roles[role]}
+                side_by_role[role] = 0.0
+                continue
+            cs = [self.match[i]["cand"] for i in bids]
+            seed_c = sum(self.B[i]["centroid_m"][0] for i in bids) / len(bids)
+            got_c = sum(self.C[c]["centroid_m"][0] for c in cs) / len(cs)
+            straddle = abs(seed_c - self.P) * MM < TOL["straddle_mm"]
+            if straddle:
+                # A cluster centred on the plane -- every mirror-symmetric
+                # pair, and the centre buttons -- has no side to change.
+                # Scoring these as passed would award three of six roles to
+                # any candidate unconditionally.  Sidedness is genuinely
+                # unverifiable here; body chirality witnesses them instead.
+                sides[role] = {"seed_x_mm": round(seed_c * MM, 1),
+                               "got_x_mm": round(got_c * MM, 1),
+                               "status": UNVERIFIABLE, "on_plane": True,
+                               "note": "cluster straddles the plane; it has "
+                                       "no side to change"}
+                continue
+            flipped = sgn(seed_c - self.P) * sgn(got_c - self.P) < 0
+            sides[role] = {"seed_x_mm": round(seed_c * MM, 1),
+                           "got_x_mm": round(got_c * MM, 1),
+                           "status": PASS if flipped else FAIL,
+                           "on_plane": False}
+            side_by_role[role] = 1.0 if flipped else 0.0
+        e_sides = (weighted_role_mean(side_by_role, default=None)
+                   if side_by_role else None)
+        checks["cluster_sides"] = {
+            "score": None if e_sides is None else round(e_sides, 4),
+            "status": UNVERIFIABLE if e_sides is None else status_of(e_sides),
+            "roles": sides,
+            "note": "ROLE-WEIGHTED fraction of off-plane clusters that "
+                    "changed side, so moving one button cluster across and "
+                    "forgetting the other scores about half, not zero. "
+                    "Clusters straddling the plane are UNVERIFIABLE, not "
+                    "free passes.",
+        }
+
+        # -- witness 2: body chirality -------------------------------------
+        chir, chir_flags = {}, []
+        for role in CHIRAL_ROLES:
+            for bid in self.Broles.get(role, []):
+                m = self.match[bid]
+                if not m["cand"]:
+                    continue
+                sb = self.B[bid]
+                ch = chirality(sb)
+                if ch < TOL["chiral_floor"]:
+                    chir[bid] = {"role": role, "status": UNVERIFIABLE,
+                                 "chirality": ch,
+                                 "note": "near mirror-symmetric; a mirror "
+                                         "cannot be read from its inertia"}
+                    continue
+                key = chirality_witness(sb)
+                s = sb["inertia_com"][key]
+                c = self.C[m["cand"]]["inertia_com"][key]
+                flipped = (s * c) < 0
+                chir_flags.append(1.0 if flipped else 0.0)
+                chir[bid] = {"role": role,
+                             "status": PASS if flipped else FAIL,
+                             "witness": key, "seed": s, "measured": c}
+        e_chir = (sum(chir_flags) / len(chir_flags)) if chir_flags else None
+        checks["body_chirality"] = {
+            "score": None if e_chir is None else round(e_chir, 4),
+            "status": UNVERIFIABLE if e_chir is None else status_of(e_chir),
+            "bodies": chir,
+            "verifiable_bodies": len(chir_flags),
+        }
+
+        # -- witness 3: port-light glyphs (the naive-flip detector) --------
+        seed_l = self.bl.get("light_cluster")
+        cand_l = self.ms.get("light_cluster")
+        if not seed_l:
+            e_lights = None
+            entry = {"score": None, "status": UNVERIFIABLE,
+                     "note": "no light cluster recorded in the baseline"}
+        elif not cand_l:
+            e_lights = None
+            entry = {"score": None, "status": UNVERIFIABLE,
+                     "note": "port-light glyph faces not found on the "
+                             "candidate (housing re-glyphed?) -- side "
+                             "cannot be witnessed"}
+        else:
+            same = seed_l["side"] == cand_l["side"]
+            e_lights = 1.0 if same else 0.0
+            entry = {"score": e_lights,
+                     "status": PASS if same else FAIL,
+                     "seed_side": seed_l["side"],
+                     "candidate_side": cand_l["side"],
+                     "candidate_x_mm": round(cand_l["centroid_m"][0] * MM, 1),
+                     "matched_faces": cand_l["n_faces"],
+                     "note": "port-light glyphs are wireless-port "
+                             "indicators, not a handed control -- they must "
+                             "stay on their original side of the plane. "
+                             "This is the ONLY witness that separates a "
+                             "proper left-hand conversion from a naive "
+                             "whole-part mirror, hence its weight."}
+        checks["port_lights_side"] = entry
+
+        # -- witness 4: housing one-sided moment ---------------------------
+        bs = self.bl.get("housing_signature", {})
+        cs_sig = self.ms.get("housing_signature", {})
+        bm, cm = bs.get("moment3_m5", 0.0), cs_sig.get("moment3_m5", 0.0)
+        b_house = self.Broles.get("housing", [])
+        c_house = self.Croles.get("housing", [])
+        remodeled = True
+        if len(b_house) == len(c_house) == 1:
+            remodeled = fp_distance(self.B[b_house[0]],
+                                    self.C[c_house[0]]) > \
+                TOL["housing_remodel_fp"]
+        entry2 = {"baseline_moment3": bm, "measured_moment3": cm,
+                  "housing_remodeled": remodeled}
+        if remodeled:
+            e_sig = None
+            entry2["score"] = None
+            entry2["status"] = UNVERIFIABLE
+            entry2["note"] = ("housing was re-shelled/remodeled -- interior "
+                              "faces dominate the moment, sign is not a "
+                              "mirror witness (port_lights_side still is)")
+        elif abs(bm) <= 0 or abs(cm) < TOL["sig_floor_frac"] * abs(bm):
+            e_sig = None
+            entry2["score"] = None
+            entry2["status"] = UNVERIFIABLE
+            entry2["note"] = "housing asymmetry signal too weak"
+        else:
+            same_side = (bm * cm) > 0
+            e_sig = 1.0 if same_side else 0.0
+            entry2["score"] = e_sig
+            entry2["status"] = PASS if same_side else FAIL
+        checks["housing_side_signature"] = entry2
+
+        # -- witness 5: housing engraved-detail side -----------------------
+        # The reason this exists: witness 4 above is UNVERIFIABLE on every
+        # candidate that actually re-shelled, which is every candidate that
+        # actually did the work, leaving the guard resting on witness 3
+        # alone. One witness means one thing to destroy, and destroying it
+        # sent the whole class to NEUTRAL_UNVERIFIABLE -- worth MORE than
+        # being caught. This witness reads different faces and fails for
+        # different reasons, so the two do not die together.
+        bd = self.bl.get("housing_detail")
+        cd = self.ms.get("housing_detail")
+        floor = TOL["detail_asym_floor"]
+        entry3 = {}
+        if not bd or not cd:
+            e_detail = None
+            entry3 = {"score": None, "status": UNVERIFIABLE,
+                      "note": "no engraved-detail measurement in the "
+                              "baseline or the capture -- re-freeze the "
+                              "baseline and re-capture to enable this "
+                              "witness (schema ps3-capture/4)"}
+        else:
+            ba, ca = bd.get("asymmetry", 0.0), cd.get("asymmetry", 0.0)
+            entry3 = {"seed_asymmetry": round(ba, 4),
+                      "candidate_asymmetry": round(ca, 4),
+                      "floor": floor,
+                      "seed_faces": [bd.get("faces_left"),
+                                     bd.get("faces_right")],
+                      "candidate_faces": [cd.get("faces_left"),
+                                          cd.get("faces_right")]}
+            if abs(ba) < floor:
+                e_detail = None
+                entry3["score"] = None
+                entry3["status"] = UNVERIFIABLE
+                entry3["note"] = ("the seed's engraved detail is balanced "
+                                  "about the plane, so it has no side to "
+                                  "keep; nothing to witness on this part")
+            elif abs(ca) < floor:
+                e_detail = None
+                entry3["score"] = None
+                entry3["status"] = UNVERIFIABLE
+                entry3["note"] = ("the candidate's engraved detail no longer "
+                                  "favours either side -- markings removed "
+                                  "or flattened, so the side cannot be read")
+            else:
+                # DETAIL_SIDE_IS_DIAGNOSTIC. The old rule was
+                # `same = (ba * ca) > 0` scored 1.0 -- the engraved detail
+                # must stay on its side -- and it is backwards here:
+                # instruction.md asks for the START/SELECT labels to end up
+                # in mirrored positions, and those labels ARE the
+                # engraving-scale housing faces this measures. It passed one
+                # model in the corpus, the one that never converted the
+                # controller, and failed every model that did.
+                #
+                # Kept, with its polarity corrected to what it actually
+                # shows, and with no weight: `moved` is what the task asks
+                # for. Not promoted to positive evidence either, because as
+                # a signal it says what cluster_sides already says and those
+                # weights are calibrated.
+                moved = (ba * ca) < 0
+                e_detail = None
+                entry3["score"] = None
+                entry3["moved_to_other_side"] = moved
+                entry3["status"] = UNVERIFIABLE
+                entry3["note"] = ("DIAGNOSTIC ONLY, CARRIES NO WEIGHT. "
+                                  "Area-weighted left/right balance of "
+                                  "engraving-scale housing faces -- the "
+                                  "START/SELECT labels among them. A sign "
+                                  "flip means they crossed the plane, which "
+                                  "instruction.md requires, so this cannot "
+                                  "guard against a naive mirror: both move "
+                                  "them. Measured, the naive-flip adversary "
+                                  "and the reference read +0.19 and +0.20. "
+                                  "port_lights_side is what separates those "
+                                  "two.")
+        checks["housing_detail_side"] = entry3
+
+        checks["symbol_glyphs"] = {
+            "score": None,
+            "status": UNVERIFIABLE,
+            "note": "PS triangle/circle/cross/square are left-right "
+                    "symmetric split-faces; a mirror is geometrically "
+                    "undetectable on the symbols themselves.  Handedness is "
+                    "graded from cluster sides, body inertia signs and the "
+                    "housing side signature instead.  Carries no weight -- "
+                    "it is UNVERIFIABLE by construction, not by accident.",
+        }
+
+        # -- combine ------------------------------------------------------
+        # Positive evidence earns the credit; the guard can only reduce it.
+        positive, pos_diag = weighted_evidence({
+            "cluster_sides": (HANDEDNESS_POSITIVE["cluster_sides"], e_sides),
+            "body_chirality": (HANDEDNESS_POSITIVE["body_chirality"], e_chir),
+        })
+        # e_detail is deliberately absent: see DETAIL_SIDE_IS_DIAGNOSTIC and
+        # the note on HANDEDNESS_GUARD. It is measured, reported, and worth
+        # nothing here, because on this task it fires on the correct answer.
+        guard, guard_diag = weighted_evidence({
+            "port_lights_side": (HANDEDNESS_GUARD["port_lights_side"],
+                                 e_lights),
+            "housing_side_signature": (
+                HANDEDNESS_GUARD["housing_side_signature"], e_sig),
+        })
+        multiplier = GUARD_FLOOR + (1.0 - GUARD_FLOOR) * clamp01(guard)
+        score = clamp01(positive) * multiplier
+
+        low_conf = (pos_diag["verified_weight_fraction"] < 1.0
+                    or guard_diag["verified_weight_fraction"] < 1.0)
+        return {"score": round(score, 4), "status": status_of(score),
+                "model": "positive_evidence x naive_flip_guard",
+                "positive_evidence": {
+                    "score": round(clamp01(positive), 4),
+                    "weights": HANDEDNESS_POSITIVE, **pos_diag},
+                "naive_flip_guard": {
+                    "score": round(clamp01(guard), 4),
+                    "multiplier": round(multiplier, 4),
+                    "floor": GUARD_FLOOR,
+                    "weights": HANDEDNESS_GUARD, **guard_diag},
+                "low_confidence": low_conf,
+                "checks": checks,
+                "match_hypotheses": self.match_diag}
+
+    # -- c7 ------------------------------------------------------------
+    def c7_markings(self):
+        """Did the face-button symbols survive the edit?
+
+        instruction.md asks for text and logos to REMAIN legible. Nothing
+        read the "remain": `adversarial_missing_glyphs` is the reference
+        with the four symbols removed and nothing else touched, and it
+        scored full marks.
+
+        Counted on the engraving-scale faces of the round-button cluster,
+        after `_resolve_button_clusters()` has settled which cluster that
+        is. The seed's four buttons carry 0, 11, 15 and 24 such faces --
+        the symbols differ, so their face counts differ -- and every model
+        in this corpus reproduces that multiset exactly or carries none at
+        all. 50 against 0; the fraction retained is what is scored, with
+        full marks from MARKINGS_FULL_FRACTION so a candidate that re-cuts
+        the symbols differently is not punished for the difference.
+
+        THE D-PAD ARROWS ARE NOT COUNTED. The seed's cross carries 44
+        engraved faces, 11 a limb, and every model that performed the
+        conversion carries 20, 5 a limb: the reference simplifies the
+        arrows when it rebuilds the cross and the adversaries inherit
+        that. There is no signal in it, only a way to take marks off every
+        model including the reference. Reported below, not scored.
+        """
+        smf_b = self.bl.get("small_face_counts") or {}
+        smf_c = self.ms.get("small_face_counts") or {}
+        bids = self.Broles.get("face_buttons") or []
+        cids = self.Croles.get("face_buttons") or []
+
+        def census(ids, smf):
+            if not ids or any(i not in smf for i in ids):
+                return None
+            return [smf[i] for i in ids]
+
+        b_faces = census(bids, smf_b)
+        c_faces = census(cids, smf_c)
+
+        # The d-pad, for the report only.
+        arrows = {"seed": census(self.Broles.get("dpad") or [], smf_b),
+                  "candidate": census(self.Croles.get("dpad") or [], smf_c),
+                  "note": "NOT SCORED -- the reference rebuilds the cross "
+                          "and simplifies its arrows (44 faces in the seed, "
+                          "20 in every converted model), so this separates "
+                          "nothing and would charge the reference for it."}
+
+        if b_faces is None or not sum(b_faces):
+            return {"score": NEUTRAL_UNVERIFIABLE, "status": UNVERIFIABLE,
+                    "detail": {"seed_engraved_faces": b_faces,
+                               "dpad_arrows": arrows},
+                    "evidence": "the seed's face buttons carry no engraving, "
+                                "so there is nothing to preserve and this "
+                                "cannot be measured either way",
+                    "caveat": "scored NEUTRAL_UNVERIFIABLE, not full marks: "
+                              "an unreadable witness must not pay better "
+                              "than a readable one that half passes."}
+
+        b_total = sum(b_faces)
+        if c_faces is None:
+            return {"score": 0.0, "status": FAIL,
+                    "detail": {"seed_engraved_faces": b_faces,
+                               "candidate_engraved_faces": None,
+                               "dpad_arrows": arrows},
+                    "evidence": f"the seed's face buttons carry {b_total} "
+                                f"engraving-scale faces; the candidate has "
+                                f"no face-button cluster to read them on"}
+
+        c_total = sum(c_faces)
+        retained = c_total / float(b_total)
+        score = clamp01(retained / MARKINGS_FULL_FRACTION)
+        return {"score": round(score, 4), "status": status_of(score),
+                # NUMBERS ONLY IN `components`: summarise() prints each one
+                # through a float format, so a list here raises TypeError at
+                # the end of an otherwise complete grade.  The per-body
+                # censuses live in `detail`.
+                "components": {"retained_fraction": round(retained, 4),
+                               "full_marks_from": MARKINGS_FULL_FRACTION},
+                "detail": {"seed_engraved_faces": sorted(b_faces),
+                           "candidate_engraved_faces": sorted(c_faces),
+                           "seed_total": b_total,
+                           "candidate_total": c_total,
+                           "dpad_arrows": arrows},
+                "evidence": f"face-button engraving: {c_total} of the seed's "
+                            f"{b_total} engraving-scale faces retained "
+                            f"({retained:.0%})",
+                "caveat": "counts engraving-scale faces on the round-button "
+                          "cluster, which is where the four PS symbols are "
+                          "cut.  It reads PRESENCE, not orientation -- the "
+                          "symbols are left-right symmetric, so a mirrored "
+                          "symbol is geometrically identical to an upright "
+                          "one and is the naive-flip guard's business, not "
+                          "this criterion's."}
+
+    # -- c5 ------------------------------------------------------------
+    TZ_MIRROR_ROLES = ("dpad", "face_buttons")
+
+    def _tz_pad(self, q):
+        """Whether a seed point lies on a pad that moves to the other side
+        (the clusters the task swaps)."""
+        if not TOL["tz_mirror"]:
+            return False
+        boxes = getattr(self, "_tz_pad_boxes", None)
+        if boxes is None:
+            r = TOL["tz_pad_reach_mm"]
+            boxes = []
+            for role in self.TZ_MIRROR_ROLES:
+                bb = (self.bl.get("role_bbox_m") or {}).get(role)
+                if bb:
+                    bb = [v * MM for v in bb]
+                    boxes.append([bb[i] - r for i in range(3)]
+                                 + [bb[i + 3] + r for i in range(3)])
+            self._tz_pad_boxes = boxes
+        return any(all(b[i] <= q[i] <= b[i + 3] for i in range(3))
+                   for b in boxes)
+
+    def _tz_pad_tag(self, SS):
+        """Tag "M" on every sample of a seed face that lies on a swapped pad
+        (at least tz_pad_face_share of its area inside a pad box): those
+        faces are compared mirrored, all others straight, a whole face at
+        a time so a big face that only touches a pad keeps its own side."""
+        if not TOL["tz_mirror"]:
+            return SS
+        out = []
+        for ps in SS:
+            if ps and len(ps[0]) == 7:
+                a = sum(q[3] for q in ps)
+                b = sum(q[3] for q in ps if self._tz_pad(q))
+                if a > 0 and b >= TOL["tz_pad_face_share"] * a:
+                    out.append([tuple(q) + ("M",) for q in ps])
+                    continue
+            out.append(ps)
+        return out
+
+    def _tz_mirrored(self, q):
+        return len(q) > 7 and q[7] == "M"
+
+    def _tz_map(self, q, P):
+        """Where a seed sample belongs on the candidate before the half's
+        move: (x, normal x sign). Pads of swapped clusters are mirrored
+        across the plane, everything else stays."""
+        if self._tz_mirrored(q):
+            return 2.0 * P - q[0], -1.0
+        return q[0], 1.0
+
+    def _tz_moves(self, q, P, moves):
+        """Each place a seed sample is expected on the candidate, with its
+        normal and side: [(sg, [(p, n) per move])]. Swept middle samples
+        (tagged "S") are not moved."""
+        n = (q[4], q[5], q[6])
+        if len(q) > 7 and q[7] == "S":
+            sg = 1 if q[0] > P else -1
+            return [(sg, [((q[0], q[1], q[2]), n)])]
+        x, f = self._tz_map(q, P)
+        n = (f * n[0], n[1], n[2])
+        d = x - P
+        sides = (1, -1) if abs(d) < TOL["halves_deadband_mm"] \
+            else ((1,) if d > 0 else (-1,))
+        stay = [((x, q[1], q[2]), n)] if len(q) > 7 and q[7] == "C" else []
+        return [(sg, [((x + sg * m, q[1], q[2]), n) for m in moves[sg]]
+                 + stay) for sg in sides]
+
+    def _skin_zones(self, P, half):
+        """Tight Zones: a box around each control body, at its candidate
+        position and at its seed position moved the way its pad moves
+        (mirrored for the swapped clusters), widened by tz_control_margin_mm."""
+        m0 = TOL["tz_control_margin_mm"]
+        dx = self.plane_shift_m * MM
+        zones = list(self._tz_centred_boxes(P, half))
+        for src, seed in ((self.ms, False), (self.bl, True)):
+            meshes = src.get("control_meshes") or {}
+            role_of = {b: r for r, bs in (src.get("roles") or {}).items()
+                       for b in bs}
+            for key, rec in meshes.items():
+                if role_of.get(key) == "housing":
+                    continue
+                tris = mesh_tris3_mm(rec)
+                if not tris:
+                    continue
+                m = TOL["tz_role_margin_mm"].get(role_of.get(key), m0)
+                lo = [min(q[i] for t in tris for q in t) for i in range(3)]
+                hi = [max(q[i] for t in tris for q in t) for i in range(3)]
+                if not seed:
+                    lo[0] += dx
+                    hi[0] += dx
+                    zones.append([v - m for v in lo] + [v + m for v in hi])
+                    continue
+                if TOL["tz_mirror"] and \
+                        role_of.get(key) in self.TZ_MIRROR_ROLES:
+                    lo[0], hi[0] = 2.0 * P - hi[0], 2.0 * P - lo[0]
+                cx = (lo[0] + hi[0]) / 2
+                if abs(cx - P) < TOL["halves_deadband_mm"]:
+                    lo[0] -= half
+                    hi[0] += half
+                else:
+                    sg = 1 if cx > P else -1
+                    lo[0] += sg * half
+                    hi[0] += sg * half
+                zones.append([v - m for v in lo] + [v + m for v in hi])
+        return zones
+
+    @staticmethod
+    def _skin_exempt(p, P, half, zones):
+        """True where an edit was asked for: the joins where each half meets
+        the widened middle (the middle itself is checked against the seed's
+        section swept across it), or near a control."""
+        d = abs(p[0] - P)
+        if not TOL["tz_sweep"]:
+            if d <= half + TOL["skin_margin_mm"]:
+                return True
+            return any(all(z[i] <= p[i] <= z[i + 3] for i in range(3))
+                       for z in zones)
+        j = TOL["tz_join_mm"] + TOL["tz_reg_slack_mm"]
+        if half - j <= d <= half + j:
+            return True
+        return _in_zones(p, zones)
+
+    # -- c5.3: skin splits ----------------------------------------------
+    def _skin_splits(self):
+        """Area of new faces cut INTO a seed face the edit had no reason to
+        touch, in mm2, with the evidence -- or None when either capture
+        predates `housing_faces` (schema /6).
+
+        Sizes change everywhere on a widened shell, so this does not compare
+        sizes. It moves every seed housing sample by the task's own rule
+        (left half -half, right half +half, faces on the plane both ways),
+        keeps the candidate faces that still lie ON that moved skin, and
+        asks which seed face each one covers. One seed face covered by two
+        candidate faces on the same side was cut into: something was
+        embossed, engraved or imprinted there. The smaller pieces are the
+        extra area.
+
+        Out of scope by construction, so a different valid solution is not
+        charged: the widening strip around the plane, a margin around every
+        control (seed and candidate positions), everything that left the
+        moved skin (a remodelled grip, a hollowed interior), a seed face
+        cut at the plane into a left and a right piece, and a piece that
+        sits on the same surface as its sibling (a split line changes no
+        geometry). Nothing here reads names or the feature tree.
+        """
+        sk = self._skin_samples()
+        if sk is None:
+            return None
+        SS, CS, _, _ = sk
+        cf = self.ms["housing_faces"]
+        P = self.P * MM
+        half = self._actual_half_m() * MM
+        dx = self.plane_shift_m * MM
+        cell = 4.0
+        grid = {}
+        n0 = len(self.bl["housing_faces"])
+        for fi, ps in enumerate(SS):
+            for q in ps:
+                if len(q) < 7:
+                    continue
+                pad = self._tz_mirrored(q)
+                for sg, places in self._tz_moves(
+                        q, P, {1: (half,), -1: (half,)}):
+                    pp, nn = places[0]
+                    # a swept sample stands for the seed face it came from
+                    s_ = (pp[0], pp[1], pp[2], nn[0], nn[1], nn[2],
+                          fi if fi < n0 else fi - n0, pad)
+                    key = tuple(int(math.floor(s_[i] / cell))
+                                for i in range(3))
+                    grid.setdefault(key, []).append(s_)
+
+        floor, get = math.floor, grid.get
+
+        def nearest(p):
+            p0, p1, p2 = p
+            k0, k1, k2 = (int(floor(p0 / cell)), int(floor(p1 / cell)),
+                          int(floor(p2 / cell)))
+            best, bd = None, 0.0
+            for ox in (-1, 0, 1):
+                for oy in (-1, 0, 1):
+                    for oz in (-1, 0, 1):
+                        for s_ in get((k0 + ox, k1 + oy, k2 + oz), ()):
+                            d2 = ((p0 - s_[0]) ** 2 + (p1 - s_[1]) ** 2
+                                  + (p2 - s_[2]) ** 2)
+                            if best is None or d2 < bd:
+                                best, bd = s_, d2
+            return best
+
+        zones = self._skin_zones(P, half)
+
+        cover, on_skin = {}, []
+        for ci, f in enumerate(cf):
+            votes, offs = {}, {}
+            on = tot = 0.0
+            for q in CS[ci]:
+                if len(q) < 7:
+                    continue
+                p = (q[0] + dx, q[1], q[2])
+                if self._skin_exempt(p, P, half, zones):
+                    continue
+                tot += q[3]
+                s_ = nearest(p)
+                if s_ is None:
+                    continue
+                if sum(q[4 + i] * s_[3 + i] for i in range(3)) \
+                        < TOL["skin_normal_dot"]:
+                    continue
+                off = sum((p[i] - s_[i]) * s_[3 + i] for i in range(3))
+                if abs(off) > TOL["skin_on_mm"]:
+                    continue
+                on += q[3]
+                key = (s_[6], 1 if p[0] > P else -1, s_[7])
+                votes[key] = votes.get(key, 0.0) + q[3]
+                offs[key] = offs.get(key, 0.0) + q[3] * off
+            if tot <= 0 or on < TOL["skin_face_frac"] * tot or not votes:
+                continue
+            on_skin.append(ci)
+            for key, a in votes.items():
+                if a >= TOL["skin_piece_min_mm2"]:
+                    cover.setdefault(key, []).append(
+                        (a, offs[key] / a, [round(v, 1) for v in f["c"]]))
+
+        extra, pieces = 0.0, []
+        for (fi, side, pad), lst in cover.items():
+            if len(lst) < 2:
+                continue
+            lst.sort(key=lambda r: -r[0])
+            base = lst[0][1]
+            for a, off, c in lst[1:]:
+                if abs(off - base) < (TOL["tz_pad_step_mm"] if pad
+                                      else TOL["skin_step_mm"]):
+                    continue
+                extra += a
+                pieces.append({"seed_face": fi, "side": side,
+                               "area_mm2": round(a, 1),
+                               "step_mm": round(off - base, 3),
+                               "centroid_mm": c})
+        pieces.sort(key=lambda r: -r["area_mm2"])
+        out = {"extra_mm2": round(extra, 1), "faces_on_skin": on_skin,
+               "pieces": pieces[:10]}
+        if not any(CS):
+            out["warning"] = ("the candidate has no housing skin samples "
+                              "(tessellation missing): nothing was checked")
+        return extra, out
+
+    def _tz_swept(self, SS):
+        """The seed's section at the plane swept across the widened middle:
+        a correct widening stretches the part there, so the surface on the
+        seed's section line runs straight across the added width. One
+        pseudo face per seed face, samples tagged "S" (not moved). Only
+        surface that runs along X (normal mostly across it) is swept."""
+        if not TOL["tz_sweep"]:
+            return []
+        P = self.P * MM
+        half = self._actual_half_m() * MM
+        j = TOL["tz_join_mm"] + TOL["tz_reg_slack_mm"]
+        lim = half - j
+        if lim <= 0:
+            return []
+        xs, x = [], -lim
+        while x <= lim + 1e-9:
+            xs.append(P + x)
+            x += SKIN_CELL_MM
+        out = []
+        span = TOL["tz_sweep_span_mm"]
+        for ps in SS:
+            if not ps or min(q[0] for q in ps) > P - span \
+                    or max(q[0] for q in ps) < P + span:
+                out.append([])
+                continue
+            band = [q for q in ps if abs(q[0] - P) <= SKIN_CELL_MM / 2
+                    and abs(q[4]) < 0.3]
+            out.append([(x, q[1], q[2], q[3], q[4], q[5], q[6], "S")
+                        for q in band for x in xs])
+        return out
+
+    def _tz_centred_boxes(self, P, half):
+        """Box around each centred seed feature (see _tz_centred), as wide
+        as the feature stretched or kept centred, plus the asym buffer: the
+        skin that frames it is kept or rebuilt with it."""
+        if not TOL["tz_sweep"]:
+            return []
+        sf = self.bl.get("housing_faces") or []
+        span = TOL["tz_sweep_span_mm"]
+        m = TOL["tz_asym_buffer_mm"]
+        boxes = []
+        for f in sf:
+            ps = [q for q in (f.get("p") or []) if len(q) >= 3]
+            if not ps:
+                continue
+            xs = [q[0] for q in ps]
+            if not (min(xs) < P < max(xs)
+                    and max(abs(x - P) for x in xs) < span):
+                continue
+            lo = [min(q[i] for q in ps) for i in range(3)]
+            hi = [max(q[i] for q in ps) for i in range(3)]
+            lo[0] -= half
+            hi[0] += half
+            boxes.append([v - m for v in lo] + [v + m for v in hi])
+        return boxes
+
+    def _tz_centred(self, SS):
+        """Seed faces that sit across the plane and end within
+        tz_sweep_span_mm of it on both sides (a small centred feature): a
+        correct widening may keep them centred instead of splitting them,
+        so their samples are tagged "C" and may also stay where they are."""
+        if not TOL["tz_sweep"]:
+            return SS
+        P = self.P * MM
+        span = TOL["tz_sweep_span_mm"]
+        out = []
+        for ps in SS:
+            if ps and min(q[0] for q in ps) < P < max(q[0] for q in ps) \
+                    and max(abs(q[0] - P) for q in ps) < span:
+                out.append([tuple(q[:7]) + ("C",) for q in ps])
+            else:
+                out.append(ps)
+        return out
+
+    def _skin_samples(self):
+        """Per housing face, the skin samples both skin checks read, for the
+        seed and the candidate, at one shared resolution: (seed, candidate,
+        cell_mm, source) -- or None when either capture has no housing_faces.
+
+        When both captures carry the full tessellation (schema /7) every
+        face is resampled from it at SKIN_CELL_MM, slivers cut to size, so
+        each sample stands only for its own patch of surface. Otherwise both
+        use the 3 mm samples the capture stored (schema /6). Never one of
+        each: a coarse sample averages a curved cell and sits slightly
+        inside the skin, and against fine samples that offset alone would
+        read as an edit."""
+        sf = self.bl.get("housing_faces")
+        cf = self.ms.get("housing_faces")
+        if not sf or not cf:
+            return None
+        if all("mt" in f for f in sf) and all("mt" in f for f in cf):
+            SS = _dense_samples(sf)
+            return (self._tz_pad_tag(self._tz_centred(SS))
+                    + self._tz_swept(SS),
+                    _dense_samples(cf),
+                    SKIN_CELL_MM, "mesh resampled at %.1f mm" % SKIN_CELL_MM)
+        clean = lambda fs: [[q for q in (f.get("p") or []) if len(q) >= 7]
+                            for f in fs]
+        return clean(sf), clean(cf), SAMPLE_CELL_M * MM, \
+            "captured 3 mm samples"
+
+    def _skin_holes(self):
+        """Area of seed skin that is no longer there although the face it
+        belongs to survived, in mm2, with the evidence -- or None when
+        either capture predates `housing_faces` (schema /6).
+
+        The other half of _skin_splits. A split sees an insert that stays
+        within skin_on_mm of the old surface; this sees one of any height:
+        a boss, a pocket, a hole, a rib, a chamfer cut into a face. Each
+        seed housing sample is moved onto the candidate and asks whether
+        the nearest candidate sample facing the same way lies on it. A seed
+        face that is mostly (skin_intact_frac) still in place is intact,
+        and a patch of it that is gone (skin_hole_min_mm2 or more) was
+        edited.
+
+        Where the seed sample is moved to: by the controls' half-widening,
+        and by the shell's own move, registered per side as the X shift
+        that puts most of that half's skin back on the candidate (the
+        reference grows its shell more than its controls, and a candidate
+        may widen the shell and not the controls). Either move may cover a
+        sample. Exempt as in _skin_splits: the widening strip (as wide as
+        the wider of the two moves) and every control at all of its
+        positions. A face that is mostly gone was remodelled -- the
+        reference reshapes its grips -- and is reported, not charged.
+        Nothing here reads names, the feature tree or the reference.
+        """
+        sk = self._skin_samples()
+        if sk is None:
+            return None
+        SS, CS, res, source = sk
+        P = self.P * MM
+        half = self._actual_half_m() * MM
+        dx = self.plane_shift_m * MM
+        sd = self._shell_delta_mm()
+        moves = [half] + ([sd / 2.0] if sd is not None else [])
+        strip = max(abs(v) for v in moves)
+        lat = TOL["skin_lateral_cells"] * res
+        cell = max(lat, 2.0)
+        reach = int(math.ceil(lat / cell))
+        grid = {}
+        for ps in CS:
+            for q in ps:
+                c_ = (q[0] + dx, q[1], q[2], q[4], q[5], q[6])
+                key = tuple(int(math.floor(c_[i] / cell)) for i in range(3))
+                grid.setdefault(key, []).append(c_)
+
+        floor, get = math.floor, grid.get
+        ndot, on_mm = TOL["skin_normal_dot"], TOL["skin_on_mm"]
+        lat2 = lat * lat
+        span = range(-reach, reach + 1)
+
+        def on_skin(p, n):
+            """The nearest same-facing candidate sample lies on (p, n)."""
+            p0, p1, p2 = p
+            n0, n1, n2 = n
+            k0, k1, k2 = (int(floor(p0 / cell)), int(floor(p1 / cell)),
+                          int(floor(p2 / cell)))
+            best = None
+            for ox in span:
+                for oy in span:
+                    for oz in span:
+                        for c_ in get((k0 + ox, k1 + oy, k2 + oz), ()):
+                            if c_[3] * n0 + c_[4] * n1 + c_[5] * n2 < ndot:
+                                continue
+                            e0, e1, e2 = p0 - c_[0], p1 - c_[1], p2 - c_[2]
+                            d = e0 * c_[3] + e1 * c_[4] + e2 * c_[5]
+                            r2 = e0 ** 2 + e1 ** 2 + e2 ** 2
+                            if r2 - d * d > lat2:
+                                continue
+                            if best is None or r2 < best[0]:
+                                best = (r2, d)
+            return best is not None and abs(best[1]) <= on_mm
+
+        zones = self._skin_zones(P, half)
+        samples = [(fi, q) for fi, ps in enumerate(SS) for q in ps]
+        reg = {}
+        for sg in (-1, 1):
+            sub = [q for _, q in samples
+                   if len(q) < 8
+                   and (q[0] - P) * sg > 0
+                   and abs(q[0] - P) > strip + TOL["skin_margin_mm"]]
+            sub = sub[::max(1, len(sub) // TOL["skin_reg_samples"])]
+            lo = min(moves) - TOL["skin_reg_pad_mm"]
+            hi = max(moves) + TOL["skin_reg_pad_mm"]
+            best, k = None, 0
+            while lo + TOL["skin_reg_step_mm"] * k <= hi + 1e-9:
+                s0 = lo + TOL["skin_reg_step_mm"] * k
+                k += 1
+                got = 0.0
+                for q in sub:
+                    p = (q[0] + sg * s0, q[1], q[2])
+                    if not self._skin_exempt(p, P, strip, zones) \
+                            and on_skin(p, q[4:7]):
+                        got += q[3]
+                if best is None or got > best[0] + 1e-9:
+                    best = (got, s0)
+            reg[sg] = best[1]
+        for v in sorted(set(reg.values())):
+            zones = zones + self._skin_zones(P, v)
+
+        # with meshes, "lies on" is asked of the candidate's own triangles:
+        # no sideways allowance, so the rim of a small edit cannot stand in
+        # for its middle
+        exact = None
+        if not source.startswith("captured"):
+            exact = self._skin_mesh()
+        faces = {}
+        moves = {1: (half, reg[1]), -1: (half, reg[-1])}
+        zgone = {}
+        for fi, q in samples:
+            for sg, places in self._tz_moves(q, P, moves):
+                ok = exempt = False
+                for p, nn in places:
+                    if self._skin_exempt(p, P, strip, zones):
+                        exempt = True
+                        break
+                    if (exact.on(p, nn, ndot) if exact is not None
+                            else on_skin(p, nn)):
+                        ok = True
+                        break
+                if not exempt:
+                    faces.setdefault((fi, sg), []).append((p, q[3], ok))
+                elif TOL["tz_sweep"] and exact is not None and not any(
+                        exact.on(pp, nn, ndot) for pp, nn in places):
+                    # skin gone inside a zone: never charged, but a patch
+                    # that runs on from it is judged with it (a rebuild cut
+                    # in pieces by the zones is still one rebuild)
+                    zgone.setdefault(sg, []).append((p, q[3], fi, True, 1))
+
+        # captured 3 mm samples lump a long triangle's whole area onto one
+        # point, so each counts one cell at most; mesh samples are exact
+        cell_a = res ** 2 if source.startswith("captured") else float("inf")
+        link2 = lat ** 2
+        # A patch of missing skin is judged by its size, wherever it lies,
+        # and across face edges (a hole on an edge is one hole). On an
+        # intact face skin_hole_min_mm2 is an edit. A face mostly gone was
+        # rebuilt (the reference reshapes its grips); there a patch from
+        # skin_rebuilt_min_mm2 to skin_rebuilt_max_mm2 is still an edit,
+        # and a bigger one is the rebuild. Where a patch spans both, the
+        # part on intact faces is judged as on an intact face.
+        extra, holes, remodelled, checked = 0.0, [], 0.0, 0.0
+        rebuilt, pools = [], {}
+        for (fi, sg), lst in faces.items():
+            tot = sum(a for _, a, _ in lst)
+            checked += tot
+            if tot <= 0:
+                continue
+            rem = sum(a for _, a, ok in lst if ok) \
+                < TOL["skin_intact_frac"] * tot
+            if rem:
+                remodelled += tot
+                rebuilt.append((fi, sg))
+            pools.setdefault(sg, []).extend(
+                (p, a, fi, rem, 0) for p, a, ok in lst if not ok)
+        self._rebuilt = {"faces": rebuilt, "reg": reg}
+        for sg, zg in zgone.items():
+            pools.setdefault(sg, []).extend(zg)
+        # a mirrored pad is compared with the other pad of the original, so
+        # a small patch on it is an edit even where the pad was rebuilt
+        mfaces = {fi for fi, ps in enumerate(SS)
+                  if ps and self._tz_mirrored(ps[0])}
+        for sg, gone in pools.items():
+            for comp in _clusters(gone, link2):
+                if all(c_[4] for c_ in comp):
+                    continue
+                a = sum(min(c_[1], cell_a) for c_ in comp if not c_[4])
+                a_rem = sum(min(c_[1], cell_a) for c_ in comp
+                            if c_[3] and not c_[4])
+                a_z = sum(min(c_[1], cell_a) for c_ in comp if c_[4])
+                # zone skin only decides whether the patch is a rebuild;
+                # a patch on intact faces keeps the intact-face threshold
+                if a_rem + a_z > TOL["skin_rebuilt_max_mm2"]:
+                    a -= a_rem
+                    if a < TOL["skin_hole_min_mm2"]:
+                        continue
+                elif a_rem <= 0.0:
+                    if a < TOL["skin_hole_min_mm2"]:
+                        continue
+                elif a < (TOL["skin_hole_min_mm2"]
+                           if TOL["tz_pad_hole_min"] and all(
+                               c_[2] in mfaces for c_ in comp if c_[3])
+                           else TOL["skin_rebuilt_min_mm2"]):
+                    continue
+                extra += a
+                holes.append({"seed_face": comp[0][2], "side": sg,
+                              "area_mm2": round(a, 1), "cells": len(comp),
+                              "at_mm": [round(v, 1) for v in comp[0][0]]})
+        holes.sort(key=lambda r: -r["area_mm2"])
+        out = {"extra_mm2": round(extra, 1),
+               "samples": source,
+               "shell_move_mm": {"left": reg[-1], "right": reg[1]},
+               "controls_move_mm": round(half, 2),
+               "remodelled_mm2": round(remodelled, 1),
+               "holes": holes[:10]}
+        # A full mark here is only evidence if there was skin to look at.
+        if not any(CS):
+            out["warning"] = ("the candidate has no housing skin samples "
+                              "(tessellation missing): nothing was checked")
+        elif checked > 0 and remodelled >= 0.9 * checked:
+            out["warning"] = ("%.0f%% of the skin reads as remodelled, so "
+                              "almost nothing was checked"
+                              % (100.0 * remodelled / checked))
+        return extra, out
+
+    def _skin_mesh(self):
+        """The candidate's housing tessellation for exact on-skin questions
+        (built once per grade)."""
+        sm = getattr(self, "_skin_mesh_cache", None)
+        if sm is None:
+            sm = self._skin_mesh_cache = SkinMesh(
+                self.ms["housing_faces"], self.plane_shift_m * MM,
+                TOL["skin_on_mm"])
+        return sm
+
+    # -- c5.6: mirror symmetry where the seed cannot be compared ----------
+    def _skin_mirror(self):
+        """Area of skin on the rebuilt faces that has no mirror image on the
+        candidate's other half, in mm2, with the evidence -- or None when
+        either capture has no meshes.
+
+        Where the candidate rebuilt a face (the reference reshapes its
+        grips), the seed says nothing about what the surface should be. The
+        part itself still does: the controller is mirror symmetric outside
+        its controls, and so is any honest rebuild of it (the reference's
+        rebuilt grips are mirror images, screw holes included). So each
+        candidate skin sample on and around the rebuilt faces is mirrored
+        across the candidate's own symmetry plane and asks whether surface
+        facing the mirrored way lies within skin_on_mm there. A patch of
+        skin_hole_min_mm2 to skin_rebuilt_max_mm2 without its mirror image
+        is a one-sided edit; a bigger one is a one-sided rebuild and is
+        reported, not charged. Exempt as in _skin_holes, on both halves.
+        An edit made identically on both halves is not seen here.
+        """
+        rb = getattr(self, "_rebuilt", None)
+        sk = self._skin_samples()
+        if sk is None or rb is None:
+            return None
+        SS, CS, res, source = sk
+        if source.startswith("captured"):
+            return None
+        if not rb["faces"]:
+            return 0.0, {"extra_mm2": 0.0, "rebuilt_faces": 0}
+        P = self.P * MM
+        half = self._actual_half_m() * MM
+        dx = self.plane_shift_m * MM
+        sd = self._shell_delta_mm()
+        strip = max(abs(v) for v in [half] + ([sd / 2.0] if sd else []))
+        zones = self._skin_zones(P, half)
+        for v in sorted(set(rb["reg"].values())):
+            zones = zones + self._skin_zones(P, v)
+        pad = TOL["skin_mirror_pad_mm"]
+        boxes = []
+        for fi, sg in rb["faces"]:
+            m = rb["reg"][sg]
+            ps = [(q[0] + sg * m, q[1], q[2]) for q in SS[fi]]
+            if ps:
+                boxes.append([min(p[i] for p in ps) - pad for i in range(3)]
+                             + [max(p[i] for p in ps) + pad
+                                for i in range(3)])
+        sm = self._skin_mesh()
+        ndot = TOL["skin_normal_dot"]
+        pts = []
+        for ps in CS:
+            for q in ps:
+                p = (q[0] + dx, q[1], q[2])
+                if not any(all(b[i] <= p[i] <= b[i + 3] for i in range(3))
+                           for b in boxes):
+                    continue
+                if self._skin_exempt(p, P, strip, zones):
+                    continue
+                pts.append((p, q[3], (-q[4], q[5], q[6])))
+
+        seed_sm = None
+        if TOL["tz_seed_sym_gate"]:
+            sf = self.bl["housing_faces"]
+            hit = _TZ_SEED_MESH.get(id(sf))
+            if hit is None or hit[0] is not sf:
+                _TZ_SEED_MESH.clear()
+                hit = _TZ_SEED_MESH[id(sf)] = (sf, SkinMesh(sf, 0.0, 0.5))
+            seed_sm = hit[1]
+
+        asym = {}
+        if seed_sm is not None:
+            bc = TOL["tz_asym_buffer_mm"]
+            for ps in SS:
+                for q in ps:
+                    if len(q) > 7 and q[7] == "S":
+                        continue
+                    if seed_sm.on((2.0 * P - q[0], q[1], q[2]),
+                                  (-q[4], q[5], q[6]), ndot):
+                        continue
+                    sg = 1 if q[0] > P else -1
+                    for mv in sorted({half, rb["reg"][sg]}):
+                        x = q[0] + sg * mv
+                        for xx in (x, 2.0 * P - x):
+                            k = (int(math.floor(xx / bc)),
+                                 int(math.floor(q[1] / bc)),
+                                 int(math.floor(q[2] / bc)))
+                            asym.setdefault(k, []).append((xx, q[1], q[2]))
+
+        def near_asym(p):
+            bc = TOL["tz_asym_buffer_mm"]
+            k0 = [int(math.floor(p[i] / bc)) for i in range(3)]
+            for a in (-1, 0, 1):
+                for b in (-1, 0, 1):
+                    for c in (-1, 0, 1):
+                        for r in asym.get((k0[0] + a, k0[1] + b, k0[2] + c),
+                                          ()):
+                            if sum((r[i] - p[i]) ** 2 for i in range(3)) \
+                                    <= bc * bc:
+                                return True
+            return False
+
+        def seed_one_sided(p, n):
+            """The seed at p moved back is itself without a mirror image."""
+            sg = 1 if p[0] > P else -1
+            for mv in sorted({half, rb["reg"][sg]}):
+                s0 = (p[0] - sg * mv, p[1], p[2])
+                nn = (-n[0], n[1], n[2])
+                if seed_sm.on(s0, nn, ndot):
+                    return not seed_sm.on((2.0 * P - s0[0], s0[1], s0[2]),
+                                          n, ndot)
+            return False
+
+        def lonely(pc, sub):
+            out = []
+            for p, a, n in sub:
+                m = (2.0 * pc - p[0], p[1], p[2])
+                if self._skin_exempt(m, P, strip, zones):
+                    continue
+                if not sm.on(m, n, ndot):
+                    if seed_sm is not None and (near_asym(p)
+                                                or seed_one_sided(p, n)):
+                        continue
+                    out.append((p, a))
+            return out
+
+        # the candidate's own plane: the shift that leaves least unmatched
+        sub = pts[::max(1, len(pts) // TOL["skin_reg_samples"])]
+        step, reach = TOL["skin_reg_step_mm"], TOL["skin_mirror_reach_mm"]
+        best = None
+        for k in range(-int(reach / step), int(reach / step) + 1):
+            pc = P + k * step
+            a = sum(a for _, a in lonely(pc, sub))
+            if best is None or a < best[0] - 1e-9:
+                best = (a, pc)
+        pc = best[1]
+        link2 = (TOL["skin_lateral_cells"] * res) ** 2
+        extra, found, one_sided = 0.0, [], 0.0
+        for comp in _clusters(lonely(pc, pts), link2):
+            a = sum(c_[1] for c_ in comp)
+            if a < TOL["skin_hole_min_mm2"]:
+                continue
+            if a > TOL["skin_rebuilt_max_mm2"]:
+                one_sided += a
+                continue
+            extra += a
+            found.append({"area_mm2": round(a, 1), "cells": len(comp),
+                          "at_mm": [round(v, 1) for v in comp[0][0]]})
+        found.sort(key=lambda r: -r["area_mm2"])
+        return extra, {"extra_mm2": round(extra, 1),
+                       "rebuilt_faces": len(rb["faces"]),
+                       "mirror_plane_x_mm": round(pc, 2),
+                       "samples_checked": len(pts),
+                       "one_sided_rebuild_mm2": round(one_sided, 1),
+                       "patches": found[:10]}
+
+    @staticmethod
+    def _skin_area_score(a):
+        """Extra skin area (mm2) to a score: free below the tessellation
+        floor, half lost by skin_half_mm2 (any real insert is a real
+        defect), then down to 0 at skin_zero_mm2."""
+        if a <= TOL["skin_perfect_mm2"]:
+            return 1.0
+        if a <= TOL["skin_half_mm2"]:
+            return 1.0 - 0.5 * (a - TOL["skin_perfect_mm2"]) / (
+                TOL["skin_half_mm2"] - TOL["skin_perfect_mm2"])
+        return 0.5 * score_error(a - TOL["skin_half_mm2"], 0.0,
+                                 TOL["skin_zero_mm2"] - TOL["skin_half_mm2"])
+
+    def c5_unrequested(self):
+        det = {}
+
+        # 5.1 -- Y/Z spans
+        sb = self.bl["global"]["bbox_m"]
+        mb = self.ms["global"]["bbox_m"]
+        worst_span, span_det = 0.0, {}
+        for ax, nm in ((1, "Y"), (2, "Z")):
+            want = (sb[ax + 3] - sb[ax]) * MM
+            got = (mb[ax + 3] - mb[ax]) * MM
+            drift = abs(got - want)
+            worst_span = max(worst_span, drift)
+            span_det[nm] = {"seed_mm": round(want, 1), "got_mm": round(got, 1),
+                            "drift_mm": round(drift, 2)}
+        span = score_error(worst_span, TOL["span_perfect_mm"],
+                           TOL["span_zero_mm"])
+        det["spans"] = span_det
+        det["worst_span_drift_mm"] = round(worst_span, 2)
+        # X is not scored (growing it is the point of the task) but is
+        # recorded: a shell widened without its controls moving is invisible
+        # to the mirror-pair proxy in c1, and this makes that case
+        # diagnosable.
+        det["x_span_mm"] = {
+            "seed": round((sb[3] - sb[0]) * MM, 2),
+            "got": round((mb[3] - mb[0]) * MM, 2),
+            "growth": round(((mb[3] - mb[0]) - (sb[3] - sb[0])) * MM, 2),
+            "note": "diagnostic only -- not scored",
+        }
+
+        # 5.2 -- shapes of the bodies the candidate was not asked to touch
+        exempt = set()
+        for role in RESHAPE_EXEMPT:
+            exempt.update(self.Broles.get(role, []))
+        worst_fp, reshaped = 0.0, {}
+        for bid, m in self.match.items():
+            if bid in exempt or not m["cand"]:
+                continue
+            d = fp_distance(self.B[bid], self.C[m["cand"]])
+            worst_fp = max(worst_fp, d)
+            if d > TOL["fp_perfect"]:
+                reshaped[bid] = {"role": m["role"], "distance": round(d, 5)}
+        shape = score_error(worst_fp, TOL["fp_perfect"], TOL["fp_zero"])
+        det["worst_fingerprint_drift"] = round(worst_fp, 5)
+        det["reshaped"] = reshaped
+
+        # 5.3 -- REPORTED, NOT CHARGED: what the exemption hides.
+        #
+        # The exemption above is load-bearing and correct -- the reference
+        # really does remodel the housing and the diamonds, so their
+        # shape cannot be compared against the seed's. It is also a door,
+        # and `adversarial_unrequested_change_elsewhere` walks through it:
+        # it is the reference plus one small cut on the housing, scores
+        # 8.000 of 8.0, and every criterion is right to give it full
+        # marks, because every criterion is measuring something else.
+        #
+        # NO THRESHOLD IS SET, and that is a measured decision rather than
+        # timidity. Across this corpus the housing runs 185 676 to
+        # 1 515 892 mm3, its face count 522 to 810, the tree 58 to 65
+        # sketches and 199 to 284 features. The model named for the
+        # unrequested change sits at 810 faces / 64 sketches / 280
+        # features -- and `adversarial_widened_by_30mm`, whose defect is
+        # something else entirely, sits above it at 799 / 65 / 284. A
+        # cut-off that catches the first flags the second. These are
+        # authored models, not one author's variations, and their trees
+        # have no common scale.
+        #
+        # (2.4.0: these counts still carry no threshold. The edit in
+        # `adversarial_unrequested_change_elsewhere` is now caught by
+        # geometry instead, by the skin checks in 5.4 and 5.5 below.)
+        #
+        # So the numbers are printed where the score is, and the score is
+        # left alone. A 7.000 that also says "three features and nine
+        # faces the seed does not have" is not the same artefact as a
+        # bare 7.000, and the next person should not have to diff two
+        # captures by hand to learn it.
+        seed_m = (self.bl.get("modelling") or {})
+        cand_m = (self.ms.get("modelling") or {})
+
+        def _n(d, *path):
+            for k in path:
+                d = (d or {}).get(k)
+            return d
+
+        seed_faces = _n(self.bl, "housing_signature", "faces")
+        cand_faces = _n(self.ms, "housing_signature", "faces")
+        tf = {"note": "diagnostic only -- not scored. The reshape check "
+                      "cannot see inside an exempt body, so these are the "
+                      "only trace an unrequested edit there leaves. They "
+                      "carry no threshold: this corpus's trees differ too "
+                      "much between authors for one to be honest.",
+              "housing_faces": {"seed": seed_faces, "got": cand_faces},
+              "sketches": {"seed": _n(seed_m, "sketches", "count"),
+                           "got": _n(cand_m, "sketches", "count")},
+              "features_scanned": {
+                  "seed": _n(seed_m, "suppressed", "features_scanned"),
+                  "got": _n(cand_m, "suppressed", "features_scanned")}}
+        for k in ("housing_faces", "sketches", "features_scanned"):
+            a, b = tf[k]["seed"], tf[k]["got"]
+            tf[k]["delta"] = (b - a) if isinstance(a, int) \
+                and isinstance(b, int) else None
+        det["tree_and_faces"] = tf
+
+        # THE WEAKER HALF DECIDES, NOT THE AVERAGE. This was
+        # `0.5 * span + 0.5 * shape`, and the average is the wrong shape for
+        # a constraint: `yz_spans` is 1.000 for every candidate that did not
+        # resize the whole part, so it held the criterion at 0.500 however
+        # badly a body was reshaped. Measured by simulation on the
+        # reference's own capture, cutting a trigger by 18.6% of its volume
+        # moved this criterion from 1.000 to 0.500 and the total from 8.000
+        # to 7.750 -- a quarter of a point, the most an unrequested change
+        # could ever cost. Either half failing means an unrequested change
+        # was made, so the criterion now reports the one that failed.
+        # 5.4 -- skin splits: a new face cut into an old one (see
+        # _skin_splits). Continuous: free below the tessellation floor,
+        # half lost by skin_half_mm2 (any real insert is a real defect),
+        # then down to 0.
+        sk = self._skin_splits()
+        if sk is None:
+            skin = 1.0
+            det["skin_splits"] = {
+                "note": "a capture has no housing_faces: not checked"}
+        else:
+            a, det["skin_splits"] = sk
+            skin = self._skin_area_score(a)
+
+        # 5.5 -- skin holes: part of an intact old face is gone (see
+        # _skin_holes). Same curve as the splits.
+        sh = self._skin_holes()
+        if sh is None:
+            hole = 1.0
+            det["skin_holes"] = {
+                "note": "a capture has no housing_faces: not checked"}
+        else:
+            a, det["skin_holes"] = sh
+            hole = self._skin_area_score(a)
+
+        # 5.6 -- skin mirror: on the faces the candidate rebuilt, a one-sided
+        # edit (see _skin_mirror). Same curve.
+        sm = self._skin_mirror() if sh is not None else None
+        if sm is None:
+            mirror = 1.0
+            det["skin_mirror"] = {
+                "note": "a capture has no meshes: not checked"}
+        else:
+            a, det["skin_mirror"] = sm
+            mirror = self._skin_area_score(a)
+
+        score = min(span, shape, skin, hole, mirror)
+        return {"score": round(score, 4), "status": status_of(score),
+                "components": {"yz_spans": round(span, 4),
+                               "body_shapes": round(shape, 4),
+                               "skin_splits": round(skin, 4),
+                               "skin_holes": round(hole, 4),
+                               "skin_mirror": round(mirror, 4)},
+                "detail": det,
+                "caveat": "housing, button diamonds and centre buttons are "
+                          "exempt from the reshape check -- the reference "
+                          "remodels them.  Sticks/triggers/bumpers must keep "
+                          "their shape.  Scored by weight, not as a gate.  "
+                          "Inside the housing, on skin the task did not ask "
+                          "to change, skin_splits catches a shallow insert "
+                          "(0.1 to 0.3 mm) and skin_holes an edit of any "
+                          "height that removes skin (boss, pocket, hole), "
+                          "and skin_mirror a one-sided edit on a face the "
+                          "candidate rebuilt (the reference reshapes its "
+                          "grips symmetrically).  Not caught: an edit near "
+                          "a control or the plane, under 0.3 mm or made on "
+                          "both halves alike on a rebuilt face, or smaller "
+                          "than 20 mm2 of missing skin: see "
+                          "detail.tree_and_faces for the trace it leaves."}
+
+    # -- assemble --------------------------------------------------------
+    def grade(self):
+        report = {"document": self.ms.get("document"),
+                  "rebuild": self.ms.get("rebuild", {}),
+                  "policy": POLICY,
+                  "plane_x_m": self.P,
+                  "plane_x_measured_m": self.ms.get("plane_x_measured_m"),
+                  "criteria": {}, "notes": []}
+
+        names = GEOMETRY_CRITERIA
+
+        reason = ungradable_reason(self.bl, self.ms)
+        if reason is None and self.Broles and self.unmatched_roles:
+            if set(self.unmatched_roles) >= {r for r, ids in
+                                             self.Broles.items() if ids}:
+                reason = ("no baseline role could be matched on this "
+                          "candidate -- the part does not resemble the seed "
+                          "closely enough to compare")
+        if reason:
+            for k in ALL_CRITERIA:
+                report["criteria"][k] = {
+                    "score": 0.0, "status": FAIL,
+                    "evidence": "not evaluated -- candidate is ungradable"}
+            report["ungradable"] = {"reason": reason,
+                                    "bodies": len(self.ms.get("bodies", [])),
+                                    "plane_x_m": self.ms.get("plane_x_m")}
+            report["overall_score"] = 0.0
+            report["overall"] = FAIL
+            report["notes"].append(f"UNGRADABLE: {reason}")
+            return report
+
+        if self.plane_shift_m:
+            report["plane_normalised_by_mm"] = round(self.plane_shift_m * MM,
+                                                     2)
+            report["notes"].append(
+                f"candidate translated {self.plane_shift_m * MM:+.1f} mm "
+                "along X; normalised to the baseline plane before comparing, "
+                "so the offset itself is not penalised")
+
+        # Health and hygiene are scored for EVERY candidate, including one
+        # whose tree does not rebuild.  Only the geometry criteria are gated:
+        # measurements taken from a broken rebuild are not trustworthy, but
+        # "how badly is it broken" is itself measurable and worth a score --
+        # otherwise every broken model collapses onto the same zero.
+        report["criteria"][C_HEALTH] = self.c0_health()
+        report["criteria"][C_HYGIENE] = self.c0_hygiene()
+
+        rb = self.ms.get("rebuild", {})
+        # A rebuild that could not even be run (errors < 0) or was never
+        # censused leaves nothing to trust: zero as before. A tree that
+        # rebuilt WITH errors is measured, and its geometry is discounted
+        # by the health score below instead of being zeroed.
+        if (not rb.get("ok", False)
+                and (rb.get("errors") is None or rb.get("errors", 0) < 0)):
+            for k in names:
+                report["criteria"][k] = {
+                    "score": 0.0, "status": FAIL,
+                    "evidence": "not evaluated -- the feature tree does not "
+                                "rebuild clean, so geometry measurements are "
+                                "not trustworthy"}
+            report["overall_score"] = round(
+                sum(v["score"] for v in report["criteria"].values())
+                / len(report["criteria"]), 4)
+            report["overall"] = FAIL
+            report["notes"].append(
+                "Rebuild gate failed: the feature tree does not rebuild clean "
+                f"vs the seed census (errors={rb.get('errors')}). Geometry "
+                "criteria are zeroed; health and hygiene are still scored.")
+            return report
+
+        ci = self.cluster_identity
+        if ci and ci.get("verdict") != "measured":
+            report["cluster_identity"] = ci
+            report["notes"].append(f"button-cluster identity: "
+                                   f"{ci['verdict']} -- {ci.get('note', '')}")
+        elif ci and ci.get("relabelled"):
+            report["cluster_identity"] = ci
+
+        if self.unmatched_roles:
+            report["unmatched_roles"] = self.unmatched_roles
+            report["notes"].append(
+                "roles present in the baseline but not matchable on the "
+                f"candidate: {sorted(self.unmatched_roles)} -- scored as "
+                "failures, not skipped")
+        report["criteria"][names[0]] = self.c1_width()
+        report["criteria"][names[1]] = self.c2_spacing()
+        report["criteria"][names[2]] = self.c3_interference()
+        report["criteria"][names[3]] = self.c4_handedness()
+        report["criteria"][names[4]] = self.c5_unrequested()
+        report["criteria"][C_MARKINGS] = self.c7_markings()
+
+        # TRUST, NOT A GATE. This used to zero all six geometry criteria on
+        # any newly broken feature, so a model whose tree carried errors but
+        # whose geometry was mostly right scored the same as one in ruins,
+        # and the criteria it actually got wrong were never measured. What
+        # the errors did to the shape is already in the geometry scores;
+        # the multiplier only discounts how far a broken rebuild's
+        # measurements can be believed.
+        if not rb.get("ok", False):
+            trust = report["criteria"][C_HEALTH]["score"]
+            for k in names:
+                c = report["criteria"][k]
+                c["measured_score"] = c["score"]
+                c["score"] = round(c["score"] * trust, 4)
+                c["status"] = status_of(c["score"])
+                c["trust_multiplier"] = trust
+            report["notes"].append(
+                f"tree rebuilds with {rb.get('errors')} newly broken "
+                f"feature(s): geometry measured, then scaled by rebuild "
+                f"health {trust:.3f}")
+
+        # A plane the harness had to borrow from the baseline means the
+        # part's own symmetry could not be read; sidedness rests on an
+        # assumption rather than a measurement.
+        src = self.ms.get("plane_source")
+        if src and src.startswith("baseline"):
+            report["notes"].append(
+                f"symmetry plane taken from the baseline ({src}); the part's "
+                "own plane could not be measured, so side judgements rest on "
+                "the seed's geometry")
+
+        st = [v["score"] for v in report["criteria"].values()]
+        report["overall_score"] = round(sum(st) / len(st), 4)
+        report["overall"] = (PASS if all(s >= 1.0 for s in st)
+                             else (FAIL if all(s <= 0.0 for s in st)
+                                   else PARTIAL))
+        return report
+
+
+def summarise(report, weights=None):
+    weights = weights or {}
+    out = [f"document : {report.get('document')}",
+           f"rebuild  : ok={report.get('rebuild', {}).get('ok')} "
+           f"errors={report.get('rebuild', {}).get('errors')}", ""]
+    for k, v in report["criteria"].items():
+        w = weights.get(k, 1.0)
+        out.append(f"  {k:32} {v['score']:.3f}  {v['status']:<8} (w={w:g})")
+        for cname, cval in (v.get("components") or {}).items():
+            out.append(f"        . {cname:28} {cval:.3f}")
+        if "positive_evidence" in v:
+            out.append(f"        . {'positive evidence':28} "
+                       f"{v['positive_evidence']['score']:.3f}")
+            out.append(f"        . {'naive-flip guard (x)':28} "
+                       f"{v['naive_flip_guard']['multiplier']:.3f}")
+        for name, entry in (v.get("checks") or {}).items():
+            if isinstance(entry, dict) and entry.get("status") == UNVERIFIABLE:
+                out.append(f"        ! {name}: UNVERIFIABLE")
+        if v.get("low_confidence"):
+            out.append("        ! low confidence: some witnesses unreadable")
+    for n in report.get("notes", []):
+        out.append(f"  note: {n}")
+    out += ["", f"  MEAN SUBSCORE    {report.get('overall_score', 0.0):.3f}"
+                f"   ({report['overall']})"]
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# task.toml integration
+# --------------------------------------------------------------------------
+
+def annotate_envelope(envelope, report):
+    """Carry the few report-level facts a consumer needs into the envelope.
+
+    finalize() emits a fixed shape; an ungradable verdict and a normalised
+    translation are things a pipeline must see without opening the full
+    report, so they are attached here rather than buried.
+    """
+    if not report:
+        return envelope
+    if report.get("ungradable"):
+        envelope["ungradable"] = report["ungradable"]
+    if report.get("plane_normalised_by_mm") is not None:
+        envelope["plane_normalised_by_mm"] = report["plane_normalised_by_mm"]
+    return envelope
+
+
+# --------------------------------------------------------------------------
+# The two halves of grading, separately invocable.
+#
+# measure_candidate() is the expensive half: it needs Windows, a licensed
+# SolidWorks and 15-30 s per part.  score_capture() is pure arithmetic over
+# two dictionaries and runs in milliseconds on any machine.
+#
+# Keeping them separable is what makes threshold work tractable: a stored
+# capture can be re-scored instantly after any rubric change, and a corpus of
+# stored captures doubles as a regression suite that needs no CAD at all.
+# --------------------------------------------------------------------------
+
+def measure_candidate(path=None, close_after=False, baseline=None):
+    """Open a part and take every measurement. Returns the capture dict.
+
+    A part SolidWorks refuses to open produces a capture marked with
+    `open_error` rather than an exception: a grading pipeline is better served
+    by an envelope scoring zero with a stated reason than by a traceback that
+    has to be read by hand.
+    """
+    baseline = baseline if baseline is not None else load_baseline()
+    app = SC.attach_app()
+    try:
+        doc = SC.open_or_active(app, path)
+    except Exception as exc:
+        return {"schema": CAPTURE_SCHEMA, "harness_version": HARNESS_VERSION,
+                "document": Path(path).name if path else None,
+                "source_path": os.path.abspath(path) if path else None,
+                "open_error": f"{type(exc).__name__}: {exc}",
+                "bodies": [], "roles": {}, "plane_x_m": None}
+    measured = capture(doc, baseline=baseline, plane_x=None)
+    measured["source_path"] = os.path.abspath(path) if path else None
+    if close_after and path:
+        # Through the shared sweep rather than a bare CloseDoc: CloseDoc is
+        # the one route that can raise the save-changes dialog, and capture
+        # has just rebuilt the document, so it is dirty by construction.
+        try:
+            SW.close_all_documents(app)
+        except Exception:
+            pass
+    for line in SW.session_report():
+        print(f"  ! {line}", file=sys.stderr)
+    return measured
+
+
+def score_capture(measured, baseline=None, weights=None, quiet=False):
+    """Grade a capture dict. No SolidWorks involved."""
+    baseline = baseline if baseline is not None else load_baseline()
+    schema = measured.get("schema")
+    hard = ungradable_reason(baseline, measured)
+    if hard:
+        # Grader cannot run on a part with no bodies or no plane; produce the
+        # same shaped report it would have.
+        report = {"document": measured.get("document"),
+                  "rebuild": measured.get("rebuild", {}),
+                  "criteria": {k: {"score": 0.0, "status": FAIL,
+                                   "evidence": "not evaluated -- candidate "
+                                               "is ungradable"}
+                               for k in ALL_CRITERIA},
+                  "ungradable": {"reason": hard,
+                                 "bodies": len(measured.get("bodies", [])),
+                                 "plane_x_m": measured.get("plane_x_m")},
+                  "overall_score": 0.0, "overall": FAIL,
+                  "notes": [f"UNGRADABLE: {hard}"]}
+    else:
+        report = Grader(baseline, measured).grade()
+    if schema and schema != CAPTURE_SCHEMA:
+        report.setdefault("notes", []).append(
+            f"capture schema {schema} differs from this harness's "
+            f"{CAPTURE_SCHEMA}; some measurements may be missing")
+    if not quiet:
+        print(summarise(report, weights), file=sys.stderr)
+    return report
+
+
+def grade_candidate(path=None, close_after=False, weights=None):
+    """Measure and score in one pass -- the default single-part flow."""
+    baseline = load_baseline()
+    measured = measure_candidate(path, close_after=close_after,
+                                 baseline=baseline)
+    # KEEP THE MEASUREMENT WHEN THE RUNNER ASKED FOR IT.
+    #
+    # `harness_cli._run_child` sets HARNESS_CAPTURE_JSON for every model of
+    # a `--batch` grade run, and `batch_grade` explains itself: "Grading
+    # keeps the capture. Measuring a corpus costs an hour of CAD and used to
+    # leave nothing behind to re-score." This harness never read the
+    # variable. It wrote HARNESS_REPORT_JSON and dropped the capture, so a
+    # nine-model run left nine reports and no way to score any of them
+    # again without re-opening SolidWorks nine times.
+    #
+    # Same shape as `--capture-only` writes, because `--score-from` reads
+    # them back interchangeably and a capture that is nearly the right
+    # shape is worse than none.
+    write_env("HARNESS_CAPTURE_JSON",
+              dump_json(measured))
+    return score_capture(measured, baseline=baseline, weights=weights)
+
+
+class PS3Harness(Harness):
+    # No score-zeroing gates: every criterion carries its own weight, so a
+    # single drifted body cannot wipe out an otherwise correct answer.  The
+    # rebuild health gate in grade() is the only hard stop.
+    MUST_PASS = ()
+    CANDIDATE_OPTIONAL = True  # without an arg, grades the live document
+    WEIGHTS = ALL_CRITERIA
+
+    def main(self):
+        # Same flow as the base class, but stamps this harness's version into
+        # the envelope instead of harness_base's contract version.
+        from common import harness_base as HB
+        if HB.is_run_request():
+            HB.runner_main(*sys.argv[2:6], fmt=self.RUNNER_FMT)
+            raise SystemExit(0)
+        candidate = (None if (self.CANDIDATE_OPTIONAL and len(sys.argv) == 1)
+                     else HB.candidate_from_argv())
+        self.timeout = HB.timeout_from_argv(self.BUILD_TIMEOUT_S)
+        state = self.build_state(candidate)
+        env = finalize(self.task_dir(), self.checks(state),
+                       version=HARNESS_VERSION,
+                       must_pass=self.MUST_PASS, weights=self.WEIGHTS)
+        return annotate_envelope(env, getattr(self, "report", None))
+
+    def build_state(self, candidate_path):
+        return candidate_path
+
+    def checks(self, state):
+        """state is the candidate path (or None for the live document)."""
+        report = grade_candidate(state, close_after=bool(state),
+                                 weights=getattr(self, "WEIGHTS", None))
+        self.report = report
+        # Batch runs want every measurement, not just the score envelope.
+        # Opt-in via the environment so the stdout contract (exactly one JSON
+        # envelope) is untouched.
+        dump = os.environ.get("HARNESS_REPORT_JSON")
+        if dump:
+            try:
+                p = Path(dump)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps(report, indent=1, default=str),
+                             encoding="utf-8")
+            except Exception as exc:
+                print(f"[warn] could not write {dump}: {exc}", file=sys.stderr)
+        registry = {}
+        for cname, crit in report["criteria"].items():
+            registry[cname] = (cname, clamp01(crit.get("score", 0.0)),
+                               crit.get("evidence", ""))
+        return registry
+
+
+main = PS3Harness.as_main()
+
+
+# --------------------------------------------------------------------------
+# baseline capture -- the CLI referenced by task.toml and solidworks_capture
+# --------------------------------------------------------------------------
+
+#: Sections the grader compares against; freeze() refuses without them.
+#: `modelling` is here because losing it once switched two thirds of the
+#: hygiene criterion off silently (journal v2.1.1).
+BASELINE_REQUIRED_KEYS = ("bodies", "roles", "plane_x_m", "modelling",
+                          "role_bbox_m")
+
+
+#: The frozen seed measurement. One object owns the path, the schema and
+#: the completeness guard; the grader still receives a plain dict.
+BASELINE = HB.Baseline(BASELINE_PATH, BASELINE_SCHEMA,
+                       BASELINE_REQUIRED_KEYS)
+
+
+def load_baseline():
+    return BASELINE.load()
+
+
+def capture_baseline(path, out_path=None):
+    """Re-freeze prompt/input.json from an unmodified seed part."""
+    out_path = Path(out_path) if out_path else BASELINE_PATH
+    app = SC.attach_app()
+    doc = SC.open_or_active(app, path)
+
+    census, meta = SC.feature_census(doc)
+    census = census or {}
+    raw, bodies, boxes, gmin, gmax = SC.capture_bodies(doc)
+    smf = _small_face_counts(raw)
+    roles = assign_roles(bodies, smf)
+    plane = sym_plane(bodies)   # no baseline yet: pure geometry
+    if plane is None:
+        raise RuntimeError("could not determine the symmetry plane from this "
+                           "part; refusing to write a baseline without one")
+    hfaces = housing_faces(raw, roles.get("housing", []))
+    sig = housing_signature(hfaces, plane)
+    detail = housing_detail_side(hfaces, plane)
+    halves = housing_halves(hfaces, plane)
+    lights = find_light_cluster_seed(hfaces, plane, gmin + gmax)
+    intf = control_interference(raw, bodies, roles)
+
+    hard = {n: c for n, (c, w) in census.items() if not w}
+    warn = {n: c for n, (c, w) in census.items() if w}
+    doc_title = str(z(doc.GetTitle))
+
+    baseline = {
+        "schema": BASELINE_SCHEMA,
+        "row": "widen 15mm + left-handed mirror (PS3 controller)",
+        "seed_document": doc_title,
+        "units": "ALL lengths in metres, volumes m^3 -- SolidWorks API units",
+        "plane_x_m": plane,
+        # The hygiene criterion grades every probe as a delta against these
+        # seed counts. Omit them and c0 quietly falls back to rebuild warnings
+        # alone, which is the one probe that needs no baseline -- a re-freeze
+        # would then look successful while removing two thirds of the check.
+        "modelling": SC.modelling_census(doc),
+        "global": {"bbox_m": gmin + gmax, "width_m": gmax[0] - gmin[0]},
+        "roles": roles,
+        "bodies": bodies,
+        "role_bbox_m": role_bboxes(bodies, roles),
+        "small_face_counts": smf,
+        "housing_signature": sig,
+        "housing_detail": detail,
+        "housing_halves": halves,
+        "light_cluster": lights,
+        "housing_faces": housing_face_list(raw, roles.get("housing", [])),
+        "control_meshes": control_meshes(raw, roles),
+        "interference": {"tested_pairs": intf["tested_pairs"],
+                         "pairs": intf["pairs"],
+                         "total_volume_m3": intf["total_volume_m3"]},
+        "rebuild": {
+            "captured_from": doc_title,
+            "features": meta.get("features", 0),
+            "errors": len(hard),
+            "warnings": len(warn),
+            "feature_errors": census,
+            "note": "per-feature error census of the unmodified seed; the "
+                    "health gate grades candidates as a delta vs this",
+        },
+        "measurement_notes": {
+            "roles": "assigned geometrically; see assign_roles()",
+            "plane": "mirror plane x from the mode of identical-pair "
+                     "centroid midpoints",
+            "housing_signature": "area-weighted 3rd moment of housing face "
+                                 "box-centres about the plane",
+            "interference": "control bodies pairwise + control vs housing",
+        },
+    }
+    BASELINE.freeze(baseline, out_path,
+                    dump=dump_json)
+    print(f"  "
+          f"({len(bodies)} bodies, plane_x={plane * MM:.2f} mm, "
+          f"{meta.get('features', 0)} features, {len(hard)} hard errors)",
+          file=sys.stderr)
+    return baseline
+
+
+def capture_seed_rebuild(path=None, out_path=None):
+    """Refresh only the rebuild census inside an existing baseline."""
+    out_path = Path(out_path) if out_path else BASELINE_PATH
+    baseline = json.loads(out_path.read_text(encoding="utf-8"))
+    app = SC.attach_app()
+    doc = SC.open_or_active(app, path)
+    census, meta = SC.feature_census(doc)
+    census = census or {}
+    hard = {n: c for n, (c, w) in census.items() if not w}
+    warn = {n: c for n, (c, w) in census.items() if w}
+    baseline["rebuild"] = {
+        "captured_from": str(z(doc.GetTitle)),
+        "features": meta.get("features", 0),
+        "errors": len(hard),
+        "warnings": len(warn),
+        "feature_errors": census,
+        "note": "per-feature error census of the unmodified seed; the health "
+                "gate grades candidates as a delta vs this",
+    }
+    out_path.write_text(dump_json(baseline), encoding="utf-8")
+    print(f"refreshed rebuild census in {out_path} "
+          f"({meta.get('features', 0)} features, {len(hard)} hard errors)",
+          file=sys.stderr)
+    return baseline
+
+
+def _out_flag(argv, default=None):
+    """Pull `-o PATH` / `--out PATH` out of argv, returning (path, rest)."""
+    rest, out = [], default
+    i = 0
+    while i < len(argv):
+        if argv[i] in ("-o", "--out") and i + 1 < len(argv):
+            out, i = argv[i + 1], i + 2
+            continue
+        rest.append(argv[i])
+        i += 1
+    return out, rest
+
+
+# --------------------------------------------------------------------------
+# batch mode -- many parts in one command
+#
+# One part is the graded contract: `harness.py part.SLDPRT` prints exactly one
+# JSON envelope and nothing else, because that is what the evaluation pipeline
+# reads.  Everything below is the development-time counterpart: a list of
+# parts, a directory of them, or a directory of stored captures, tabulated
+# side by side.  It lives here rather than in a companion script so there is
+# one entry point to keep working and one place where a criterion name, a
+# label or an output layout is defined.
+#
+# Each part is still graded in its own child process.  Measurement talks to a
+# live SolidWorks over COM, and a call that wedges there would otherwise take
+# the whole batch with it; a child can be timed out and the run continues.
+# --------------------------------------------------------------------------
+
+# Reference first, then the adversarials, then the loose ends.  Anything not
+# named here still runs -- it is appended in the order it was given.
+BATCH_ORDER = [
+    "solution",
+    "adversarial_widened_15mm_clusters_at_original_spacing",
+    "adversarial_unwidened_shell_with_correct_clusters",
+    "adversarial_widened_by_30mm",
+    "adversarial_text_mirrored_incorrectly",
+    "adversarial_only_one_button_cluster_mirrored",
+    "adversarial_feature_tree_with_errors",
+    "gpt5",
+    "examples_solution_copy",
+    "input",
+]
+
+SHORT = {C_HEALTH: "heal", C_HYGIENE: "hyg"}
+SHORT.update({c: f"C{i + 1}" for i, c in enumerate(GEOMETRY_CRITERIA)})
+
+
+def discover_models(task_dir):
+    """{label: path} for a task directory laid out like the shipped one.
+
+    Falls back to a recursive glob for any other directory, so pointing the
+    batch at a folder of candidate submissions works without a convention.
+    """
+    task_dir = Path(task_dir)
+    found = {}
+
+    ref = task_dir / "solution" / "solution.SLDPRT"
+    if ref.is_file():
+        found["solution"] = ref
+    ex = task_dir / "examples"
+    if ex.is_dir():
+        # each adversarial ships in its own examples/<name>/ folder
+        for p in sorted(ex.rglob("*.SLDPRT")):
+            if p.name.startswith("~$"):      # SolidWorks lock file
+                continue
+            # examples/solution.SLDPRT is byte-identical to the reference
+            # (same sha256 in task.toml). Kept as a determinism check, but
+            # labelled so it is not mistaken for an adversarial.
+            found["examples_solution_copy" if p.stem == "solution"
+                  else p.stem] = p
+    seed = task_dir / "environment" / "input.SLDPRT"
+    if seed.is_file():
+        found["input"] = seed        # the "did nothing" control
+
+    if not found:
+        for p in sorted(task_dir.rglob("*.SLDPRT")):
+            if p.name.startswith("~$"):
+                continue
+            label, n = p.stem, 2
+            while label in found:
+                label, n = f"{p.stem}_{n}", n + 1
+            found[label] = p
+
+    ordered = {k: found[k] for k in BATCH_ORDER if k in found}
+    for k, v in found.items():
+        ordered.setdefault(k, v)
+    return ordered
+
+
+#: Where the dataset sits relative to this file, when nobody says otherwise.
+#: From the repository root found by walking up for common/, not
+#: from a count of `..`. Counting was right while the harness sat
+#: beside the dataset and wrong the moment it moved inside it, and
+#: a wrong task dir does not raise -- it finds no models.
+DEFAULT_TASK_DIR = HERE.parents[2]
+DEFAULT_CAPTURE_DIR = TASK_DIR.parent.parent / "captures"
+
+
+# --------------------------------------------------------------------------
+# command line -- the runner itself is common/harness_cli.py
+# --------------------------------------------------------------------------
+
+def envelope_from(report, weights=None):
+    """report -> the graded envelope. Same contract as every other task."""
+    weights = weights if weights is not None else PS3Harness.WEIGHTS
+    checks = {n: (n, clamp01(c.get("score", 0.0)), c.get("evidence", ""))
+              for n, c in report["criteria"].items()}
+    env = finalize(PS3Harness.task_dir(), checks, version=HARNESS_VERSION,
+                   must_pass=PS3Harness.MUST_PASS, weights=weights)
+    return annotate_envelope(env, report)
+
+
+def _score_stored(path):
+    measured = json.loads(Path(path).read_text(encoding="utf-8"))
+    return score_capture(measured,
+                         weights=PS3Harness.WEIGHTS)
+
+
+def _capture_note(cap):
+    """One line about what a capture actually got hold of."""
+    return f"{len(cap.get('bodies') or [])} bodies"
+
+
+SPEC = HC.Spec(
+    harness_file=__file__,
+    version=HARNESS_VERSION,
+    capture_schema=CAPTURE_SCHEMA,
+    baseline_schema=BASELINE_SCHEMA,
+    criteria=ALL_CRITERIA,
+    short=SHORT,
+    order=BATCH_ORDER,
+    discover=discover_models,
+    default_task_dir=DEFAULT_TASK_DIR,
+    default_capture_dir=DEFAULT_CAPTURE_DIR,
+    model_glob="*.SLDPRT",
+    model_noun=("part", "parts"),
+    model_width=52,                 # labels here run to 51 characters
+    measure=lambda path: measure_candidate(path, close_after=bool(path)),
+    dump=dump_json,
+    capture_note=_capture_note,
+    score=_score_stored,
+    summarise=lambda report: summarise(
+        report, PS3Harness.WEIGHTS),
+    envelope=envelope_from,
+    capture_baseline=capture_baseline,
+    # This task's second frozen artefact: the seed's own rebuild state, which
+    # the health criterion is a delta from.
+    extra_modes={"--capture-seed-rebuild":
+                 lambda argv: capture_seed_rebuild(
+                     argv[0] if argv else None,
+                     argv[1] if len(argv) > 1 else None)},
+    extra_usage="  harness.py --capture-seed-rebuild SEED.SLDPRT [out.json]\n",
+    harness_cli=PS3Harness.cli,
+)
+
+
+def cli(argv=None):
+    HC.cli(SPEC, argv)
+
+
+# -- Tight Zones added on top: the checks of the current grader all stay ----
+# The criterion is graded both ways and the lower score stands, so this
+# version can only catch more than the current one, never less. The current
+# grader is read from ../harness/harness.py.
+def _load_current():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        os.pardir, "harness", "harness.py")
+    spec = importlib.util.spec_from_file_location("_harness_current", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_CURRENT = _load_current()
+_tz_c5 = Grader.c5_unrequested
+
+
+def _c5_both(self):
+    tz = _tz_c5(self)
+    cur = _CURRENT.Grader(self.bl, self.ms).c5_unrequested()
+    if cur["score"] < tz["score"]:
+        out = dict(cur)
+        out["detail"] = dict(cur.get("detail") or {}, tight_zones=tz.get(
+            "detail"), decided_by="current checks")
+        return out
+    out = dict(tz)
+    out["detail"] = dict(tz.get("detail") or {}, decided_by="tight zones")
+    return out
+
+
+Grader.c5_unrequested = _c5_both
+
+
+if __name__ == "__main__":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+    cli()

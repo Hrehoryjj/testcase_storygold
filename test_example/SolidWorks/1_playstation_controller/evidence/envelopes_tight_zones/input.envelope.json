@@ -1,0 +1,17 @@
+{
+ "task_id": "solidworks-0001-playstation-controller",
+ "score": 2.9824,
+ "max_score": 8.0,
+ "passed": false,
+ "subscores": {
+  "rebuild health": 1.0,
+  "modelling hygiene": 1.0,
+  "widened by 15 mm": 0.0,
+  "clusters at mirrored positions": 0.0,
+  "no new control interference": 1.0,
+  "left-handed layout achieved": 0.0,
+  "no unrequested changes": 0.9647,
+  "markings preserved": 1.0
+ },
+ "harness_version": "2.5.0"
+}
